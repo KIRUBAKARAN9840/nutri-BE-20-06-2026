@@ -9,7 +9,7 @@ import json
 from app.models.async_database import get_async_db
 from app.models.adminmodels import Admins
 from app.models.fittbot_models import Client, ActualDiet, ActualWorkout, ClientActual
-from app.models.nutrition_models import NutritionConsultationForm, CompletedSession, ClientDietTemplate, Nutritionist
+from app.models.nutrition_models import NutritionConsultationForm, CompletedSession, ClientDietTemplate, Nutritionist, DietTemplate
 from app.fittbot_admin_api.auth.authentication import get_current_admin_from_cookie
 
 def format_time_slot(t: time) -> str:
@@ -569,4 +569,62 @@ async def get_client_water_logs(
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while fetching water logs: {str(e)}"
+        )
+
+
+@router.get("/client/{client_id}/template-view/{template_id}")
+async def get_client_template_view_details(
+    client_id: int,
+    template_id: int,
+    db: AsyncSession = Depends(get_async_db),
+    admin: Admins = Depends(get_current_admin_from_cookie)
+):
+    """
+    Get client name and template details combined for the template day-wise view page
+    """
+    try:
+        # Fetch client details to get client name
+        client_query = select(Client).where(Client.client_id == client_id)
+        client_result = await db.execute(client_query)
+        client = client_result.scalar_one_or_none()
+
+        if not client:
+            raise HTTPException(
+                status_code=404,
+                detail="Client not found"
+            )
+
+        # Fetch the diet template details
+        template_query = select(DietTemplate).where(DietTemplate.id == template_id)
+        template_result = await db.execute(template_query)
+        template = template_result.scalar_one_or_none()
+
+        if not template:
+            raise HTTPException(
+                status_code=404,
+                detail="Diet template not found"
+            )
+
+        return {
+            "success": True,
+            "data": {
+                "client_name": client.name,
+                "template": {
+                    "id": template.id,
+                    "template_name": template.template_name,
+                    "number_of_days": template.number_of_days,
+                    "diet_data": template.diet_data,
+                    "description": template.description,
+                    "session_no": template.session_no,
+                    "created_at": template.created_at.isoformat() if template.created_at else None,
+                    "updated_at": template.updated_at.isoformat() if template.updated_at else None
+                }
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while fetching template view details: {str(e)}"
         )
