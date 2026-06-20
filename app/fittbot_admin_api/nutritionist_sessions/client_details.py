@@ -130,6 +130,7 @@ async def get_client_details(
             Client.name.label('client_name'),
             ClientDietTemplate.template_id.label('assigned_diet_template_id'),
             ClientDietTemplate.template_name.label('assigned_diet_template_name'),
+            ClientDietTemplate.assigned_date.label('assigned_date'),
             Nutritionist.full_name.label('nutritionist_name')
         ).select_from(
             CompletedSession
@@ -169,7 +170,8 @@ async def get_client_details(
                 "slot_time": format_time_slot(session.slot_time),
                 "created_at": session.created_at.isoformat() if session.created_at else None,
                 "assigned_diet_template_id": session.assigned_diet_template_id,
-                "assigned_diet_template_name": session.assigned_diet_template_name
+                "assigned_diet_template_name": session.assigned_diet_template_name,
+                "assigned_date": convert_date_to_irst(session.assigned_date)
             })
 
         return {
