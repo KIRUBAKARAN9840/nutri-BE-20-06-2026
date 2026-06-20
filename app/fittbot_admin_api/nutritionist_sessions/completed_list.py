@@ -331,6 +331,7 @@ async def get_assign_template_data(
             DietTemplate.number_of_days,
             DietTemplate.description,
             DietTemplate.diet_data,
+            DietTemplate.session_no,
             DietTemplate.created_at
         ).where(
             DietTemplate.nutritionist_id == nutritionist_id
@@ -350,6 +351,7 @@ async def get_assign_template_data(
                 "number_of_days": template.number_of_days,
                 "description": template.description,
                 "diet_data": template.diet_data,
+                "session_no": template.session_no,
                 "created_at": template.created_at.isoformat() if template.created_at else None
             })
 

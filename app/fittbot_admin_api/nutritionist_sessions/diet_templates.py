@@ -82,6 +82,12 @@ async def create_diet_template(
                 detail="template_name is required"
             )
 
+        if "session_no" not in template_data or template_data["session_no"] is None:
+            raise HTTPException(
+                status_code=400,
+                detail="session_no is required"
+            )
+
         if "number_of_days" not in template_data or not template_data["number_of_days"]:
             raise HTTPException(
                 status_code=400,
@@ -100,7 +106,8 @@ async def create_diet_template(
             template_name=template_data["template_name"],
             number_of_days=template_data["number_of_days"],
             diet_data=template_data["diet_data"],
-            description=template_data.get("description")
+            description=template_data.get("description"),
+            session_no=template_data.get("session_no")
         )
 
         db.add(new_template)
@@ -115,6 +122,7 @@ async def create_diet_template(
                 "number_of_days": new_template.number_of_days,
                 "diet_data": new_template.diet_data,
                 "description": new_template.description,
+                "session_no": new_template.session_no,
                 "created_at": new_template.created_at.isoformat() if new_template.created_at else None
             },
             "message": "Diet template created successfully"
@@ -161,6 +169,7 @@ async def get_diet_templates(
                 "template_name": template.template_name,
                 "number_of_days": template.number_of_days,
                 "description": template.description,
+                "session_no": template.session_no,
                 "is_assigned": template.id in assigned_ids,
                 "created_at": template.created_at.isoformat() if template.created_at else None,
                 "updated_at": template.updated_at.isoformat() if template.updated_at else None
@@ -238,6 +247,7 @@ async def get_diet_template(
                 "number_of_days": template.number_of_days,
                 "diet_data": template.diet_data,
                 "description": template.description,
+                "session_no": template.session_no,
                 "created_at": template.created_at.isoformat() if template.created_at else None,
                 "updated_at": template.updated_at.isoformat() if template.updated_at else None
             }
@@ -290,6 +300,13 @@ async def update_diet_template(
             template.diet_data = template_data["diet_data"]
         if "description" in template_data:
             template.description = template_data["description"]
+        if "session_no" in template_data:
+            if template_data["session_no"] is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="session_no is required"
+                )
+            template.session_no = template_data["session_no"]
 
         template.updated_at = datetime.now()
 
@@ -304,6 +321,7 @@ async def update_diet_template(
                 "number_of_days": template.number_of_days,
                 "diet_data": template.diet_data,
                 "description": template.description,
+                "session_no": template.session_no,
                 "updated_at": template.updated_at.isoformat() if template.updated_at else None
             },
             "message": "Diet template updated successfully"

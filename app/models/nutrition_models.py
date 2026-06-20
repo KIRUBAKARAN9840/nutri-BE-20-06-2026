@@ -265,6 +265,7 @@ class DietTemplate(Base):
     diet_data = Column(JSON, nullable=False, default=list)
 
     description = Column(Text, nullable=True)
+    session_no = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
