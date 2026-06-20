@@ -246,15 +246,7 @@ async def get_client_food_logs(
     db: AsyncSession = Depends(get_async_db),
     admin: Admins = Depends(get_current_admin_from_cookie)
 ):
-    """
-    Get paginated food logs for a client.
 
-    Fully async with optimized queries:
-    - Single count query for total records
-    - Single data query with OFFSET/LIMIT for pagination
-    - No loops with database calls
-    - JSON parsing done in-memory (pure functions)
-    """
     try:
         # Build base conditions for filtering
         conditions = [ActualDiet.client_id == client_id]
