@@ -1,0 +1,36 @@
+flowchart LR
+    subgraph AWS["AWS ap-south-2"]
+        APP["FastAPI + Celery"]
+    end
+
+    subgraph PAYMENTS["💳 Payments"]
+        RZP["Razorpay<br/>(checkout · webhooks)"]
+        RZPX["RazorpayX<br/>(settlements · payouts)"]
+        RC["RevenueCat<br/>(App Store + Play Store)"]
+    end
+
+    subgraph AI["🤖 AI / ML"]
+        OAI["OpenAI<br/>(Tier3 + 3× Tier1 pool)"]
+        GROQ["Groq<br/>(ASR / transcription)"]
+        GEM["Google Gemini 2.5 Flash<br/>(chatbot fallback)"]
+        ANT["Anthropic<br/>(installed, light use)"]
+    end
+
+    subgraph COMM["📣 Communications"]
+        FCM["Firebase FCM<br/>(client push)"]
+        EXPO["Expo Push<br/>(owner push)"]
+        WA["WhatsApp Infinito<br/>(OTP · nudges)"]
+        BS["BhashSMS / pwtpl<br/>(SMS OTP)"]
+        SMTP["Office365 SMTP<br/>(transactional email)"]
+    end
+
+    APP --> RZP & RZPX & RC
+    APP --> OAI & GROQ & GEM & ANT
+    APP --> FCM & EXPO & WA & BS & SMTP
+
+    classDef pay fill:#d9ead3,stroke:#38761d
+    classDef ai fill:#cfe2f3,stroke:#0b5394
+    classDef comm fill:#fce5cd,stroke:#b45f06
+    class RZP,RZPX,RC pay
+    class OAI,GROQ,GEM,ANT ai
+    class FCM,EXPO,WA,BS,SMTP comm

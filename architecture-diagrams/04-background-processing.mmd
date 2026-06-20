@@ -1,0 +1,72 @@
+flowchart LR
+    API["FastAPI API<br/>(Fittbot-Production × 2)"]
+
+    subgraph REDIS_BROKER["Redis (broker + result backend)<br/>cache.r7g.large"]
+        Q_PAY[("queue:payments")]
+        Q_AI[("queue:ai")]
+        Q_DIET[("queue:chat_diet_jobs")]
+        Q_DEF[("queue:celery (default)")]
+        Q_ACT[("activity:events:queue")]
+    end
+
+    API -->|LPUSH| Q_PAY
+    API -->|LPUSH| Q_AI
+    API -->|LPUSH| Q_DIET
+    API -->|LPUSH| Q_ACT
+
+    subgraph WORKERS["ECS Fargate Workers"]
+        WPAY["Celery-Payment_Queue<br/>prefork concurrency 4"]
+        WAI["celery_production_service<br/>prefork concurrency 4"]
+        WDIET["Fittbot-AI-DietCoach<br/>gevent (long-running)"]
+        WACT["Client-Tracking-service<br/>prefork concurrency 4"]
+        BEAT["Celery Beat<br/>(scheduler)"]
+    end
+
+    Q_PAY -->|RPOP| WPAY
+    Q_AI -->|RPOP| WAI
+    Q_DIET -->|RPOP| WDIET
+    Q_DEF -->|RPOP| WACT
+    Q_ACT -->|LPOP every 70s| WACT
+
+    subgraph EVENTBRIDGE["EventBridge"]
+        EB1["daily_analysis_role<br/>cron(35 21 * * ?)"]
+        EB2["compressor_image<br/>(S3 event)"]
+    end
+
+    subgraph LAMBDAS["AWS Lambda"]
+        L1["lambda_reminder<br/>(reminder fan-out)"]
+        L2["feedcompressor<br/>(image compression)"]
+        L3["lambda_feed_post"]
+        L4["attendance-out-punch"]
+        L5["lambda_generalReminder_producer"]
+        L6["lambda_generalReminder_subscriber"]
+        L7["lambda-attendance-exp-producer"]
+        L8["receipt_mail"]
+    end
+
+    EB1 --> L1
+    EB2 --> L2
+
+    BEAT -->|every 70s| Q_DEF
+    BEAT -->|every 30 min| Q_DEF
+    BEAT -->|hourly| Q_DEF
+    BEAT -->|every 5 min| Q_DEF
+
+    WPAY --> RZP[Razorpay/RazorpayX]
+    WPAY --> RC[RevenueCat]
+    WAI --> OAI[OpenAI/Groq]
+    WDIET --> OAI
+    WACT --> WA[WhatsApp]
+    WACT --> EXPO[Expo Push]
+
+    L1 --> SQS[(SQS Reminders)]
+    SQS --> WREM["reminder-service<br/>polls 30s"]
+    WREM --> FCM[Firebase FCM]
+    WREM --> RDS[(RDS)]
+
+    classDef redis fill:#fce5cd,stroke:#b45f06
+    classDef worker fill:#d9ead3,stroke:#38761d
+    classDef ext fill:#f4cccc,stroke:#990000
+    class Q_PAY,Q_AI,Q_DIET,Q_DEF,Q_ACT redis
+    class WPAY,WAI,WDIET,WACT,WREM,BEAT worker
+    class RZP,RC,OAI,WA,EXPO,FCM ext

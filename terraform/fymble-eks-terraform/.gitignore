@@ -1,0 +1,58 @@
+# =====================================================================
+# Terraform .gitignore — protects secrets, state, and local artefacts.
+# Never remove the *.tfstate rules.
+# =====================================================================
+
+# ---- State files (CONTAIN SECRETS — never commit) ----
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# ---- Local Terraform working directories ----
+.terraform/
+.terraform.lock.hcl
+
+# ---- Plan output files (may contain sensitive values) ----
+*.tfplan
+*.tfplan.*
+plan.out
+tfplan
+
+# ---- Variable files (often contain account IDs, ARNs, secrets) ----
+# Commit only the example file, never the real one.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!example.tfvars
+
+# ---- Override files (used for local-only overrides) ----
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ---- CLI configuration ----
+.terraformrc
+terraform.rc
+
+# ---- Backup / swap / OS noise ----
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- IDE / editor ----
+.idea/
+.vscode/
+*.iml
+
+# ---- Secrets (extra safety net) ----
+*.pem
+*.key
+*.crt
+secrets/
+.env
+.env.*

@@ -1,0 +1,7 @@
+region                 = "ap-south-2"
+ecs_cluster_name       = "dev-codedeploy-cluster-test"
+ecs_service_name       = "Fittbot-Production"
+rds_instance_id        = "devfittbotdb"
+elasticache_cluster_id = "fittbot-dev-cluster-new"
+alb_arn_suffix         = "app/dev-lb-new/a6922d9f8a33b357"
+target_group_arn_suffix = "targetgroup/dev-blue-target-group-new/cd795a490fbf63a2"

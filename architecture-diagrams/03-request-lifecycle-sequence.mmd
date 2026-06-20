@@ -1,0 +1,56 @@
+sequenceDiagram
+    autonumber
+    participant U as User (Mobile / Web)
+    participant DNS as Route 53
+    participant WAF as AWS WAF
+    participant ALB as ALB dev-lb-new
+    participant API as ECS Fittbot-Production
+    participant RD as ElastiCache Redis
+    participant DB as RDS MySQL
+    participant Q as Celery Queue (Redis)
+    participant W as Celery Worker
+    participant EXT as External (Razorpay/OpenAI/FCM)
+
+    U->>DNS: app.fymble.app
+    DNS-->>U: ALB IP
+    U->>WAF: HTTPS request
+    WAF->>ALB: forwarded (passes rules)
+    ALB->>API: HTTP :8000
+
+    rect rgb(220,235,255)
+        Note over API,RD: Auth + Rate-limit middleware
+        API->>RD: jail:{ip}, rl:{ip}:m:{bucket}
+        RD-->>API: jail state · counter
+    end
+
+    alt Read path (home page, profile, feed)
+        API->>RD: home:v2:ustate:{cid}
+        alt cache miss (58% of GETs)
+            API->>DB: SELECT ...
+            DB-->>API: rows
+            API->>RD: SETEX home:v2:ustate (cache)
+        end
+        API-->>U: 200 JSON
+    else Payment path (checkout/verify/webhook)
+        API->>RD: {prefix}:cmd:{cmdid} (idempotency check)
+        API->>Q: LPUSH payments queue
+        API-->>U: 202 Accepted
+        Q->>W: RPOP task
+        W->>EXT: Razorpay API
+        EXT-->>W: payment result
+        W->>DB: UPDATE orders
+        W->>RD: SETEX {prefix}:capture:{pid} (24h TTL)
+        W->>RD: PUBLISH user_channel:{cid}
+        RD-->>API: pubsub fan-out
+        API-->>U: WebSocket: payment_confirmed
+    else WebSocket path (live gym buddy, chat)
+        U->>ALB: wss://api.fymble.app/ws
+        ALB->>API: HTTP upgrade
+        API->>RD: SUBSCRIBE gym:{gymid}, live:{cid}
+        loop
+            EXT-->>API: any event
+            API->>RD: PUBLISH channel
+            RD->>API: fanned to N subscribers
+            API->>U: frame
+        end
+    end

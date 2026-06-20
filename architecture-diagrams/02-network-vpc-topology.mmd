@@ -1,0 +1,43 @@
+flowchart TB
+    INTERNET((Internet))
+
+    subgraph VPC["🏢 VPC vpc-0f268fb3dc0dd0600 · 10.0.0.0/16 · ap-south-2"]
+        IGW["Internet Gateway<br/>igw-0709a4e3db58ecc48"]
+
+        subgraph PUB["🟢 Public Subnets (ALB + NAT)"]
+            P2A["subnet-06fd7a321c77c1def<br/>ap-south-2a · 10.0.0.0/24<br/>★ NAT GW here"]
+            P2B["subnet-00c1b09f6f02aff10<br/>ap-south-2b · 10.0.1.0/24"]
+            P2C["subnet-04e1a6607004b72a9<br/>ap-south-2c · 10.0.2.0/24"]
+            ALB["ALB dev-lb-new<br/>Internet-facing<br/>HTTPS 443"]
+            NAT["NAT Gateway<br/>nat-04867289b85560c1e<br/>EIP 18.60.96.58"]
+        end
+
+        subgraph PRV["🟡 Private Subnets (ECS + RDS + Redis)"]
+            R2A["subnet-0c2101a6a7e7bf803<br/>ap-south-2a · 10.0.10.0/24<br/>★ RDS Primary here"]
+            R2B["subnet-0b59975c322d501c6<br/>ap-south-2b · 10.0.11.0/24"]
+            R2C["subnet-0d9f1514dcdf67874<br/>ap-south-2c · 10.0.12.0/24<br/>★ Redis here"]
+            ECS["ECS Fargate Tasks × 8<br/>(awsvpc network mode)"]
+            RDS[(RDS MySQL<br/>devfittbotdb · 2a)]
+            RED[(ElastiCache Redis<br/>fittbot-dev-cluster-new · 2c)]
+        end
+
+        VPCE["VPC Endpoint (Gateway)<br/>vpce-0d53cf8d2a4c3829e<br/>com.amazonaws.ap-south-2.s3"]
+    end
+
+    INTERNET <--> IGW
+    IGW <--> ALB
+    IGW <--> NAT
+    ALB -.->|target groups| ECS
+    ECS --> NAT --> IGW
+    ECS --> VPCE
+    ECS <--> RDS
+    ECS <--> RED
+    RDS -.private DNS.- ECS
+    RED -.private DNS.- ECS
+
+    classDef pub fill:#d9ead3,stroke:#38761d
+    classDef prv fill:#fff2cc,stroke:#bf9000
+    classDef ep fill:#cfe2f3,stroke:#0b5394
+    class P2A,P2B,P2C,ALB,NAT pub
+    class R2A,R2B,R2C,ECS,RDS,RED prv
+    class VPCE,IGW ep

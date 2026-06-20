@@ -1,0 +1,77 @@
+flowchart TB
+    subgraph EDGE["🌐 EDGE TIER"]
+        DNS["Route 53 / DNS<br/>fymble.app · fittbot.com"]
+        CDN["CloudFront / Cloudflare<br/>(static assets, planned)"]
+    end
+
+    subgraph PRESENTATION["📱 PRESENTATION TIER (Multi-channel)"]
+        MOB["Mobile Apps<br/>iOS + Android (Expo / React Native)"]
+        WEB["Web Frontend<br/>admin.fittbot.com (React)"]
+        PG["Payment Gateway UI<br/>payments.fymble.app (Next.js)"]
+    end
+
+    subgraph SECURITY["🛡️ SECURITY TIER"]
+        WAF["AWS WAFv2<br/>Regional Web ACL"]
+        ALB["Application Load Balancer<br/>dev-lb-new (HTTPS 443)"]
+    end
+
+    subgraph APP["⚙️ APPLICATION TIER (ECS Fargate)"]
+        API["FastAPI API<br/>Fittbot-Production × 2<br/>1 vCPU · 2 GB"]
+        WPAY["Celery Payments Worker<br/>Celery-Payment_Queue<br/>1 vCPU · 3 GB"]
+        WAI["Celery General Worker<br/>celery_production_service<br/>1 vCPU · 3 GB"]
+        WDIET["Celery AI-Diet Worker (gevent)<br/>Fittbot-AI-DietCoach<br/>0.5 vCPU · 1 GB"]
+        WACT["Client Tracking Worker<br/>Client-Tracking-service<br/>0.5 vCPU · 1 GB"]
+        WREM["Reminder Poller<br/>reminder-service<br/>0.25 vCPU · 1 GB"]
+        FPG["Payment Gateway App<br/>fittbot-pg-service<br/>0.5 vCPU · 1 GB"]
+    end
+
+    subgraph DATA["💾 DATA TIER"]
+        RDS[("RDS MySQL<br/>devfittbotdb<br/>db.t3.medium · 20 GB gp2")]
+        REDIS[("ElastiCache Redis<br/>fittbot-dev-cluster-new<br/>cache.r7g.large")]
+        S3[("S3 Buckets<br/>fittbot-uploads · esign-docs · tfstate · cloudtrail")]
+    end
+
+    subgraph SERVERLESS["⚡ SERVERLESS TIER"]
+        LAMBDA["Lambda × 8<br/>reminder · feed_post · attendance ·<br/>feedcompressor · receipt_mail"]
+        EB["EventBridge<br/>4 cron rules"]
+    end
+
+    subgraph EXT["🌍 EXTERNAL DEPENDENCIES"]
+        RZP["Razorpay + RazorpayX"]
+        RC["RevenueCat"]
+        AI["OpenAI · Groq · Gemini · Anthropic"]
+        PUSH["Firebase FCM + Expo Push"]
+        COMM["WhatsApp (Infinito) · BhashSMS · pwtpl"]
+        SMTP["Office365 SMTP"]
+    end
+
+    MOB --> DNS --> WAF --> ALB
+    WEB --> DNS
+    PG --> DNS
+    ALB --> API & FPG
+    API <--> REDIS
+    API <--> RDS
+    API --> S3
+    WPAY --> RZP
+    WPAY <--> RDS & REDIS
+    WAI --> AI
+    WAI <--> RDS & REDIS
+    WDIET --> AI
+    WACT --> COMM
+    WREM --> RDS
+    API --> AI & PUSH & COMM & SMTP
+    EB --> LAMBDA
+    LAMBDA --> RDS & S3 & SMTP
+
+    classDef edge fill:#e1f5ff,stroke:#0070c0
+    classDef sec fill:#fff2cc,stroke:#bf9000
+    classDef app fill:#d9ead3,stroke:#38761d
+    classDef data fill:#fce5cd,stroke:#b45f06
+    classDef serv fill:#ead1dc,stroke:#a64d79
+    classDef ext fill:#f4cccc,stroke:#990000
+    class DNS,CDN edge
+    class WAF,ALB sec
+    class API,WPAY,WAI,WDIET,WACT,WREM,FPG app
+    class RDS,REDIS,S3 data
+    class LAMBDA,EB serv
+    class RZP,RC,AI,PUSH,COMM,SMTP ext

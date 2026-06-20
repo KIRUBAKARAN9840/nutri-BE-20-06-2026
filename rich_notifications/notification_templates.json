@@ -1,0 +1,510 @@
+{
+  "dailypass": {
+    "images": [
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_1.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_2.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_3.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_4.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_5.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_6.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_7.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_8.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_9.png",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/new_dailypass_10.png"
+    ],
+    "templates": [
+      {
+        "title": "Your gym, your choice 🏋️",
+        "body": "Book Daily Passes at nearby gyms starting from ₹99."
+      },
+      {
+        "title": "One city. So many gyms 💪",
+        "body": "Don't limit yourself to just one. Fymble Daily Passes start at just ₹99 🔥"
+      },
+      {
+        "title": "Pay only for the days you train 💪",
+        "body": "That's the Fymble way. Starting at just ₹99."
+      },
+      {
+        "title": "No membership. No commitments.",
+        "body": "Just book a Daily Pass and train your way 💪 Starting at ₹99."
+      },
+      {
+        "title": "Today's workout = Tomorrow's confidence 💪",
+        "body": "Book your Daily Pass now. Starting at just ₹99."
+      },
+      {
+        "title": "No membership. No worries.",
+        "body": "Book your Daily Pass now 🔥 Starting at just ₹99."
+      },
+      {
+        "title": "Work out where you want, when you want.",
+        "body": "Fymble makes fitness flexible. Starting at just ₹99."
+      },
+      {
+        "title": "Why pay for a full membership when you only need today? 💪",
+        "body": "Just book a Daily Pass and train your way. Starting at ₹99."
+      },
+      {
+        "title": "No joining fees. No commitments.",
+        "body": "Just workouts starting at ₹99 with Fymble."
+      },
+      {
+        "title": "Traveling or exploring new gyms?",
+        "body": "Fymble Daily Pass gives you instant one-day gym access. Starting at ₹99."
+      },
+      {
+        "title": "One app. Multiple gyms. Unlimited flexibility.",
+        "body": "Daily Passes from ₹99 only on Fymble."
+      },
+      {
+        "title": "Why stick to one gym when you can explore many?",
+        "body": "Book a Daily Pass with Fymble today. Starting at ₹99."
+      }
+    ]
+  },
+  "fitness_classes": {
+    "images": [
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/zumba.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/pilates.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/dance.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/aerobics.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/martial_arts.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/boxing.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/swimming.webp",
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/gymnastics.webp"
+    ],
+    "templates": [
+      {
+        "title": "A fitness class is happening near you 💪",
+        "body": "Find a class nearby and book now! Starting at ₹99."
+      },
+      {
+        "title": "Something exciting is happening near you 👀",
+        "body": "Join a fitness class today. Starting at ₹99."
+      },
+      {
+        "title": "Your body wants movement. Your mind needs energy 🔥",
+        "body": "Fitness Classes from just ₹99."
+      },
+      {
+        "title": "Move better. Feel stronger. Live healthier ✨",
+        "body": "Book classes starting at ₹99."
+      },
+      {
+        "title": "Feel the beat. Burn the stress 💃",
+        "body": "Zumba classes starting at just ₹99 🔥",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/zumba.webp"
+      },
+      {
+        "title": "Turn calories into choreography 💃",
+        "body": "Join Zumba classes from just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/zumba.webp"
+      },
+      {
+        "title": "Calories are waiting to disappear 🔥",
+        "body": "Zumba classes near you — starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/zumba.webp"
+      },
+      {
+        "title": "Stretch with control. Move with power ✨",
+        "body": "Pilates classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/pilates.webp"
+      },
+      {
+        "title": "Your posture will thank you later 🌿",
+        "body": "Pilates classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/pilates.webp"
+      },
+      {
+        "title": "Your core has an appointment 💪",
+        "body": "Pilates classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/pilates.webp"
+      },
+      {
+        "title": "Breathe in peace. Breathe out stress ✨",
+        "body": "Join a Yoga class today. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp"
+      },
+      {
+        "title": "Less stress. More peace. Better day🌿",
+        "body": "Book a Yoga class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp"
+      },
+      {
+        "title": "Stretch the body. Calm the chaos ✨",
+        "body": "Yoga classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp"
+      },
+      {
+        "title": "Deep breaths await ✨",
+        "body": "Yoga classes happening near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp"
+      },
+      {
+        "title": "Peace is cheaper than therapy 👀",
+        "body": "Book Yoga classes from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/yoga.webp"
+      },
+      {
+        "title": "Turn your energy into moves ✨",
+        "body": "Dance classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/dance.webp"
+      },
+      {
+        "title": "Confidence starts with movement 💃",
+        "body": "Book a Dance class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/dance.webp"
+      },
+      {
+        "title": "Feel the rhythm. Forget the world 🔥",
+        "body": "Dance classes starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/dance.webp"
+      },
+      {
+        "title": "The floor is waiting for your moves 🔥",
+        "body": "Dance classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/dance.webp"
+      },
+      {
+        "title": "Sweat, smile, repeat 🔥",
+        "body": "Aerobics classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/aerobics.webp"
+      },
+      {
+        "title": "High energy. Full vibes. Endless sweat 💪",
+        "body": "Book an Aerobics class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/aerobics.webp"
+      },
+      {
+        "title": "Your Sweat session awaits 🔥",
+        "body": "Aerobics classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/aerobics.webp"
+      },
+      {
+        "title": "No lazy vibes allowed here 😎",
+        "body": "Aerobics classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/aerobics.webp"
+      },
+      {
+        "title": "Train your body. Master your mind ⚔️",
+        "body": "Martial Arts classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/martial_arts.webp"
+      },
+      {
+        "title": "Train like a warrior. Think like a champion 🔥",
+        "body": "Book a Martial Arts class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/martial_arts.webp"
+      },
+      {
+        "title": "Future black belt energy ⚔️",
+        "body": "Martial Arts classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/martial_arts.webp"
+      },
+      {
+        "title": "Your inner fighter is waiting 👀⚔️",
+        "body": "Book a Martial Arts class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/martial_arts.webp"
+      },
+      {
+        "title": "Gloves on. Stress gone 🥊",
+        "body": "Boxing classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/boxing.webp"
+      },
+      {
+        "title": "Your gloves are waiting 🥊",
+        "body": "Boxing classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/boxing.webp"
+      },
+      {
+        "title": "Anger issues? Boxing says welcome 😂🥊",
+        "body": "Boxing classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/boxing.webp"
+      },
+      {
+        "title": "Let the water reset your mind 💦",
+        "body": "Swimming classes starting at just ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/swimming.webp"
+      },
+      {
+        "title": "The water's perfect 🌊",
+        "body": "Swimming classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/swimming.webp"
+      },
+      {
+        "title": "Strength meets flexibility 💪",
+        "body": "Book a Gymnastics class from ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/gymnastics.webp"
+      },
+      {
+        "title": "Flip into something exciting ✨",
+        "body": "Gymnastics classes near you. Starting at ₹99.",
+        "image": "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/gymnastics.webp"
+      }
+    ]
+  },
+  "personal_training": {
+    "images": [
+      "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/workout.webp"
+    ],
+    "templates": [
+      {
+        "title": "Train with guidance. Transform with confidence ⚡",
+        "body": "Book Personal Training today."
+      },
+      {
+        "title": "Results happen faster with the right coach 💪",
+        "body": "Book Personal Training today."
+      },
+      {
+        "title": "A trainer is ready to help you level up 🔥",
+        "body": "Personal Training classes near you."
+      },
+      {
+        "title": "Real results need real guidance 💪",
+        "body": "Personal Training near you."
+      }
+    ]
+  },
+  "ai": {
+    "food_scanner": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/food_scanner.webp"
+      ],
+      "templates": [
+        {
+          "title": "Kyra sees protein, carbs & calories 👀",
+          "body": "While you just see delicious biryani 🍛 50 scans for ₹99."
+        },
+        {
+          "title": "Had your favorite meal already? 🍛",
+          "body": "Don't forget to show Kyra before she gets upset 👀📸 50 scans for ₹99."
+        },
+        {
+          "title": "Meet Kyra 👀",
+          "body": "Your AI that understands what's on your plate 🍽️ 50 scans for ₹99."
+        },
+        {
+          "title": "From biryani to burgers 🍛🍔",
+          "body": "Kyra helps you know what's inside — 50 scans for ₹99."
+        },
+        {
+          "title": "Kyra is that one friend who always asks 💪",
+          "body": "\"Okay… but how much protein?\" 50 scans for ₹99."
+        },
+        {
+          "title": "Snap first. Bite later 📸🔥",
+          "body": "Kyra tells you what's really on your plate. 50 scans for ₹99."
+        },
+        {
+          "title": "Snap your meal 📸",
+          "body": "Let Kyra do the counting 🥗 50 scans for ₹99."
+        },
+        {
+          "title": "Every meal tells a story 🍽️",
+          "body": "Kyra helps you read it — 50 scans for ₹99."
+        },
+        {
+          "title": "Biryani today? Salad tomorrow? 🍛🥗",
+          "body": "Kyra understands both. 50 smart scans at ₹99."
+        },
+        {
+          "title": "Healthy eating starts with honest scanning 👀",
+          "body": "Scan your meals with Kyra today. 50 scans for ₹99."
+        }
+      ]
+    },
+    "diet_plan": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/ai_diet_coach.webp"
+      ],
+      "templates": [
+        {
+          "title": "Your pocket nutritionist is finally here 👀",
+          "body": "Meet Kyra AI — guiding your food choices for just ₹499."
+        },
+        {
+          "title": "Confused about what to eat? 🍽️",
+          "body": "Kyra AI helps you choose smarter meals for just ₹499."
+        },
+        {
+          "title": "Weight loss, muscle gain, or healthy eating? 🔥",
+          "body": "Kyra AI prepares a diet plan made just for you."
+        },
+        {
+          "title": "A smarter diet plan starts with understanding you 👀",
+          "body": "That's exactly what Kyra AI does. At just ₹499."
+        },
+        {
+          "title": "Your body is unique. Your diet plan should be too ✨",
+          "body": "Get a personalized plan from Kyra AI at ₹499."
+        },
+        {
+          "title": "Your personal nutritionist… 😌💙",
+          "body": "Without the expensive attitude. Kyra AI at ₹499."
+        }
+      ]
+    }
+  },
+  "personal_coach": {
+    "consultation": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/nutrition_consultation.webp"
+      ],
+      "templates": [
+        {
+          "title": "Need guidance from a nutritionist? 🍽️💪",
+          "body": "Book your consultation slot now at just ₹199."
+        },
+        {
+          "title": "Your goals need the right nutrition too 🔥",
+          "body": "Book a nutrition consultation slot for ₹199."
+        },
+        {
+          "title": "One conversation can change your eating habits 💙",
+          "body": "Talk to a nutritionist at ₹199."
+        },
+        {
+          "title": "Your body deserves expert advice ✨",
+          "body": "Nutrition consultation slots available at ₹199."
+        },
+        {
+          "title": "Whether it's fat loss or healthy eating 💪",
+          "body": "A nutritionist can guide you — starting at ₹199."
+        },
+        {
+          "title": "Talk to a nutritionist about your goals 💪",
+          "body": "Get clarity on what to eat — just ₹199."
+        },
+        {
+          "title": "Stop taking random diet advice from the internet 😌",
+          "body": "Speak with a nutritionist directly for ₹199."
+        },
+        {
+          "title": "Your body has questions 👀🍽️",
+          "body": "A nutritionist has answers. Book at ₹199."
+        },
+        {
+          "title": "Talk to a nutritionist before your next 'Monday diet' 😏",
+          "body": "Real guidance for just ₹199."
+        }
+      ]
+    },
+    "plan": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/nutrition_plan.webp"
+      ],
+      "templates": [
+        {
+          "title": "Personalized Nutrition Plans starting at ₹2499 💪",
+          "body": "Diet plans + expert sessions + Kyra AI scans."
+        },
+        {
+          "title": "Not just diet plans 👀",
+          "body": "We guide, track, and support your transformation."
+        },
+        {
+          "title": "4 expert sessions. Personalized diet. Real progress ✨",
+          "body": "Book your slot at ₹2499."
+        },
+        {
+          "title": "Your body doesn't need another random diet 👀",
+          "body": "It needs a clear plan made for YOU."
+        },
+        {
+          "title": "Your body deserves better than random diets 👀",
+          "body": "Start your 1 Month Nutrition Plan at ₹2499."
+        },
+        {
+          "title": "Not just a diet… A plan that understands YOU 💙",
+          "body": "Start at ₹2499."
+        },
+        {
+          "title": "No confusion. No guessing. No crash diets 🔥",
+          "body": "Just proper nutrition guidance that fits your lifestyle."
+        },
+        {
+          "title": "Structure, support, and accountability 💙",
+          "body": "Book your 1 Month Nutrition Plan at ₹2499."
+        },
+        {
+          "title": "Six-pack or family-pack? Decision time 😂",
+          "body": "Book your Nutrition Plan today at ₹2499."
+        },
+        {
+          "title": "POV: You finally stopped taking advice from random reels 😂",
+          "body": "Book a real Nutrition Plan at ₹2499."
+        }
+      ]
+    }
+  },
+  "engagement": {
+    "step_counter": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/steps.webp"
+      ],
+      "templates": [
+        {
+          "title": "How many steps do you really walk in a day? 👀",
+          "body": "Start tracking your movement now."
+        },
+        {
+          "title": "Small steps today = big transformation tomorrow 💪",
+          "body": "Track your steps and stay accountable."
+        },
+        {
+          "title": "Every step counts more than you think 👀",
+          "body": "Let's track your movement and turn it into progress."
+        },
+        {
+          "title": "Bro, check your steps… not just Instagram 👀",
+          "body": "See how active you really are today."
+        },
+        {
+          "title": "POV: You walked only to the fridge today 😭",
+          "body": "Time to check your step counter."
+        },
+        {
+          "title": "Step counter never lies 👀",
+          "body": "See your real movement data today."
+        }
+      ]
+    },
+    "rewards": {
+      "images": [
+        "https://fittbot-uploads.s3.ap-south-2.amazonaws.com/Notifications/WhatsApp+Image+2026-02-10+at+11.44.29.jpeg"
+      ],
+      "templates": [
+        {
+          "title": "Win an iPhone 17 Pro Max!",
+          "body": "Book a DailyPass or Fitness Classes and win an iPhone 17 Pro Max!"
+        },
+        {
+          "title": "1st Prize: iPhone 17 Pro Max!",
+          "body": "Grand Rewards LIVE! Win iPhone 17 Pro Max or AirPods!"
+        },
+        {
+          "title": "Book once. Win big.",
+          "body": "One DailyPass at Rs.99 = a shot at iPhone 17 Pro Max!"
+        },
+        {
+          "title": "Grand Rewards are LIVE!",
+          "body": "Every booking = one entry. Win iPhone 17 or AirPods!"
+        },
+        {
+          "title": "Rs.99 could win you an iPhone 17 Pro Max",
+          "body": "Rs.99 DailyPass could win you an iPhone 17 Pro Max!"
+        },
+        {
+          "title": "iPhone 17 for the winner, AirPods for runners-up!",
+          "body": "Grand Rewards are here! Every booking = a chance to win big!"
+        },
+        {
+          "title": "Don't miss the Mega Giveaway!",
+          "body": "Win iPhone 17 Pro Max or AirPods! DailyPass at Rs.99 to enter!"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars (which is .gitignored) and fill in real values.
+
+aws_region          = "ap-south-2"
+environment         = "prod"
+owner               = "platform"
+
+cluster_name        = "fymble-prod"
+kubernetes_version  = "1.34"
+
+vpc_id              = "vpc-0f268fb3dc0dd0600"
+
+eks_subnet_ids = [
+  "subnet-05370c7b4eab2133a",
+  "subnet-0ccd3bb848e0b18d5",
+  "subnet-09875775695f50196",
+]
+
+# Public access — leave [] to force a hard error, then add ONLY your office /
+# bastion / NAT IPs as /32 CIDRs. Never 0.0.0.0/0 in production.
+cluster_endpoint_public_access       = true
+cluster_endpoint_public_access_cidrs = [
+  # "203.0.113.42/32",   # office gateway
+  # "198.51.100.7/32",   # bastion
+]
+
+enabled_cluster_log_types     = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+cloudwatch_log_retention_days = 90
+kms_key_deletion_window_days  = 30

@@ -1,0 +1,7 @@
+region                 = "ap-south-2"
+ecs_cluster_name       = "dev-codedeploy-cluster-test"
+ecs_service_name       = "Fittbot-Production"
+rds_instance_id        = ""  # your RDS instance ID
+elasticache_cluster_id = ""  # your ElastiCache cluster ID
+alb_arn_suffix         = ""  # e.g., "app/my-alb/1234567890"
+target_group_arn_suffix = "" # e.g., "targetgroup/my-tg/1234567890"

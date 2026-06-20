@@ -1,0 +1,4415 @@
+# Purchases API for Admin Dashboard
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, or_, and_, not_, false, cast, Integer, func, union_all, literal, distinct, desc, asc, String
+from typing import Optional
+import json
+import io
+from datetime import datetime, date, timedelta
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font
+
+from app.models.fittbot_models import Client, Gym, GymOwner, SessionPurchase, SessionBookingDay, FittbotGymMembership, ClassSession, SessionSetting
+from app.models.async_database import get_async_db
+from app.models.dailypass_models import DailyPass, DailyPassDay, DailyPassPricing
+from app.fittbot_api.v1.payments.models.payments import Payment
+from app.fittbot_api.v1.payments.models.orders import Order, OrderItem
+from app.fittbot_api.v1.payments.models.subscriptions import Subscription
+from app.fittbot_api.v1.payments.models.entitlements import Entitlement
+from app.models.nutrition_models import NutritionEligibility
+
+router = APIRouter(prefix="/api/admin/purchases", tags=["AdminPurchases"])
+
+
+@router.get("/all-purchases")
+async def get_all_purchases(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client or gym name"),
+    type: Optional[str] = Query(None, description="Filter by type: 'Session' or 'Daily Pass'"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    distinct_clients: Optional[bool] = Query(False, description="Show only distinct clients (1 booking across all types)"),
+    distinct_gyms: Optional[bool] = Query(False, description="Show only distinct gyms (1 booking across all types)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    try:
+        search_pattern = f"%{search}%" if search else None
+
+        # Parse dates if provided
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+        today = datetime.now().date()
+
+        today_daily_pass_query = (
+            select(func.count(DailyPass.id))
+            .select_from(DailyPass)
+            .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+            .where(DailyPass.gym_id != "1")
+            .where(func.date(DailyPass.created_at) == today)
+        )
+        today_session_query = (
+            select(func.count(SessionPurchase.id))
+            .select_from(SessionPurchase)
+            .join(Gym, SessionPurchase.gym_id == Gym.gym_id)
+            .where(SessionPurchase.status == "paid")
+            .where(SessionPurchase.gym_id != 1)
+            .where(func.date(SessionPurchase.created_at) == today)
+        )
+        today_daily_pass_count = (await db.execute(today_daily_pass_query)).scalar() or 0
+        today_session_count = (await db.execute(today_session_query)).scalar() or 0
+        today_bookings = int(today_daily_pass_count) + int(today_session_count)
+
+        # Build DailyPass subquery with type label
+        daily_pass_query = (
+            select(
+                DailyPass.id.label("id"),
+                DailyPass.client_id.label("client_id"),
+                DailyPass.gym_id.label("gym_id"),
+                literal("Daily Pass").label("type"),
+                DailyPass.days_total.label("days_total"),
+                literal(None).label("total_sessions"),
+                literal(None).label("scheduled_sessions"),
+                (Payment.amount_minor / 100.0).label("amount"),
+                DailyPass.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Gym.contact_number.label("gym_contact"),
+                GymOwner.contact_number.label("owner_contact"),
+                GymOwner.name.label("owner_name"),
+                Gym.area.label("gym_area"),
+                Gym.city.label("gym_city"),
+                Client.contact.label("client_contact"),
+                Client.platform.label("platform"),
+                literal(None).label("session_name"),
+                DailyPass.head_count.label("head_count"),
+                (DailyPassPricing.discount_price / 100.0).label("discount_price")
+            )
+            .select_from(DailyPass)
+            .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)  # Inner join - exclude if gym not found
+            .outerjoin(Client, cast(DailyPass.client_id, Integer) == Client.client_id)
+            .outerjoin(GymOwner, Gym.owner_id == GymOwner.owner_id)
+            .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+            .outerjoin(DailyPassPricing, DailyPass.gym_id == DailyPassPricing.gym_id)
+            .where(DailyPass.gym_id != "1")  # Exclude gym_id = 1
+        )
+
+        # Build SessionPurchase subquery with type label (only paid status)
+        session_purchase_query = (
+            select(
+                SessionPurchase.id.label("id"),
+                SessionPurchase.client_id.label("client_id"),
+                SessionPurchase.gym_id.label("gym_id"),
+                literal("Session").label("type"),
+                literal(None).label("days_total"),
+                SessionPurchase.sessions_count.label("total_sessions"),
+                SessionPurchase.scheduled_sessions.label("scheduled_sessions"),
+                SessionPurchase.payable_rupees.label("amount"),
+                SessionPurchase.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Gym.contact_number.label("gym_contact"),
+                GymOwner.contact_number.label("owner_contact"),
+                GymOwner.name.label("owner_name"),
+                Gym.area.label("gym_area"),
+                Gym.city.label("gym_city"),
+                Client.contact.label("client_contact"),
+                Client.platform.label("platform"),
+                ClassSession.name.label("session_name"),
+                literal(1).label("head_count"),
+                (
+                    select(SessionSetting.final_price)
+                    .where(SessionSetting.gym_id == SessionPurchase.gym_id)
+                    .where(SessionSetting.session_id == SessionPurchase.session_id)
+                    .limit(1)
+                    .scalar_subquery()
+                ).label("discount_price")
+            )
+            .select_from(SessionPurchase)
+            .join(Gym, SessionPurchase.gym_id == Gym.gym_id)  # Inner join - exclude if gym not found
+            .join(ClassSession, SessionPurchase.session_id == ClassSession.id)
+            .outerjoin(Client, SessionPurchase.client_id == Client.client_id)
+            .outerjoin(GymOwner, Gym.owner_id == GymOwner.owner_id)
+            .where(SessionPurchase.status == "paid")
+            .where(SessionPurchase.gym_id != 1)  # Exclude gym_id = 1
+        )
+
+        # Apply search filters to both subqueries if search is provided
+        if search:
+            daily_pass_query = daily_pass_query.where(
+                or_(
+                    Client.name.ilike(search_pattern),
+                    Client.contact.ilike(search_pattern),
+                    Gym.name.ilike(search_pattern)
+                )
+            )
+            session_purchase_query = session_purchase_query.where(
+                or_(
+                    Client.name.ilike(search_pattern),
+                    Client.contact.ilike(search_pattern),
+                    Gym.name.ilike(search_pattern)
+                )
+            )
+
+        # Apply date filters to both subqueries if provided
+        if start_date_obj:
+            daily_pass_query = daily_pass_query.where(func.date(DailyPass.created_at) >= start_date_obj)
+            session_purchase_query = session_purchase_query.where(func.date(SessionPurchase.created_at) >= start_date_obj)
+        if end_date_obj:
+            daily_pass_query = daily_pass_query.where(func.date(DailyPass.created_at) <= end_date_obj)
+            session_purchase_query = session_purchase_query.where(func.date(SessionPurchase.created_at) <= end_date_obj)
+
+        # Combine both queries with UNION ALL
+        combined_query = union_all(daily_pass_query, session_purchase_query).alias("combined_purchases")
+
+        # Build distinct filtering subqueries (if distinct filter is requested)
+        distinct_client_filter = None
+        distinct_gym_filter = None
+
+        if distinct_clients or distinct_gyms:
+            # Get gym memberships base data for distinct calculation
+            gym_membership_data_query = (
+                select(
+                    Order.customer_id.label("client_id"),
+                    OrderItem.gym_id.label("gym_id"),
+                    Order.order_metadata.label("order_metadata")
+                )
+                .select_from(Payment)
+                .join(Order, Order.id == Payment.order_id)
+                .join(OrderItem, OrderItem.order_id == Order.id)
+                .where(Payment.status == "captured")
+                .where(Order.status == "paid")
+                .where(OrderItem.gym_id.isnot(None))
+                .where(OrderItem.gym_id != "1")
+            )
+
+            # Apply date filters to gym memberships
+            if start_date_obj:
+                gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) >= start_date_obj)
+            if end_date_obj:
+                gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) <= end_date_obj)
+
+            gm_result = await db.execute(gym_membership_data_query)
+            gm_rows = gm_result.all()
+
+            # Filter by metadata conditions
+            valid_client_ids = []
+            valid_gym_ids = []
+            for row in gm_rows:
+                metadata = row.order_metadata
+                if not metadata or not isinstance(metadata, dict):
+                    continue
+
+                condition1 = (
+                    metadata.get("audit") and isinstance(metadata.get("audit"), dict) and
+                    metadata["audit"].get("source") == "dailypass_checkout_api"
+                )
+                condition2 = (
+                    metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                    metadata["order_info"].get("flow") == "unified_gym_membership_with_sub"
+                )
+                condition3 = (
+                    metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                    metadata["order_info"].get("flow") == "unified_gym_membership_with_free_fittbot"
+                )
+
+                if condition1 or condition2 or condition3:
+                    if row.client_id:
+                        try:
+                            valid_client_ids.append(int(row.client_id))
+                        except:
+                            pass
+                    if row.gym_id and row.gym_id.isdigit():
+                        valid_gym_ids.append(int(row.gym_id))
+
+            # Build distinct client filter (clients with exactly 1 booking total)
+            if distinct_clients:
+                # Count bookings per client from sessions/daily passes
+                session_client_counts = (
+                    select(
+                        combined_query.c.client_name,
+                        func.count().label("booking_count")
+                    )
+                    .select_from(combined_query)
+                    .where(combined_query.c.client_name.isnot(None))
+                    .group_by(combined_query.c.client_name)
+                )
+                if type:
+                    session_client_counts = session_client_counts.where(combined_query.c.type == type)
+                session_client_result = await db.execute(session_client_counts)
+                session_client_counts_map = {row.client_name: row.booking_count for row in session_client_result.all()}
+
+                # Count gym memberships per client
+                gm_client_counts_map = {}
+                if valid_client_ids:
+                    gm_client_query = (
+                        select(Client.name, func.count().label("gm_count"))
+                        .where(Client.client_id.in_(valid_client_ids))
+                        .where(Client.name.isnot(None))
+                        .group_by(Client.name)
+                    )
+                    gm_client_result = await db.execute(gm_client_query)
+                    gm_client_counts_map = {row.name: row.gm_count for row in gm_client_result.all()}
+
+                # Find distinct clients (total count == 1)
+                distinct_client_names = set()
+                for client_name in set(session_client_counts_map.keys()) | set(gm_client_counts_map.keys()):
+                    total = session_client_counts_map.get(client_name, 0) + gm_client_counts_map.get(client_name, 0)
+                    if total == 1:
+                        distinct_client_names.add(client_name)
+
+                if distinct_client_names:
+                    distinct_client_filter = distinct_client_names
+
+            # Build distinct gym filter (gyms with exactly 1 booking total)
+            if distinct_gyms:
+                # Count bookings per gym from sessions/daily passes
+                session_gym_counts = (
+                    select(
+                        combined_query.c.gym_name,
+                        func.count().label("booking_count")
+                    )
+                    .select_from(combined_query)
+                    .where(combined_query.c.gym_name.isnot(None))
+                    .group_by(combined_query.c.gym_name)
+                )
+                if type:
+                    session_gym_counts = session_gym_counts.where(combined_query.c.type == type)
+                session_gym_result = await db.execute(session_gym_counts)
+                session_gym_counts_map = {row.gym_name: row.booking_count for row in session_gym_result.all()}
+
+                # Count gym memberships per gym
+                gm_gym_counts_map = {}
+                if valid_gym_ids:
+                    gm_gym_query = (
+                        select(Gym.name, func.count().label("gm_count"))
+                        .where(Gym.gym_id.in_(valid_gym_ids))
+                        .where(Gym.name.isnot(None))
+                        .group_by(Gym.name)
+                    )
+                    gm_gym_result = await db.execute(gm_gym_query)
+                    gm_gym_counts_map = {row.name: row.gm_count for row in gm_gym_result.all()}
+
+                # Find distinct gyms (total count == 1)
+                distinct_gym_names = set()
+                for gym_name in set(session_gym_counts_map.keys()) | set(gm_gym_counts_map.keys()):
+                    total = session_gym_counts_map.get(gym_name, 0) + gm_gym_counts_map.get(gym_name, 0)
+                    if total == 1:
+                        distinct_gym_names.add(gym_name)
+
+                if distinct_gym_names:
+                    distinct_gym_filter = distinct_gym_names
+
+        # Apply type filter to combined query if type is provided
+        if type:
+            count_query = select(func.count()).select_from(combined_query).where(combined_query.c.type == type)
+        else:
+            count_query = select(func.count()).select_from(combined_query)
+
+        # Apply distinct client filter
+        if distinct_client_filter:
+            count_query = count_query.where(combined_query.c.client_name.in_(distinct_client_filter))
+
+        # Apply distinct gym filter
+        if distinct_gym_filter:
+            count_query = count_query.where(combined_query.c.gym_name.in_(distinct_gym_filter))
+
+        count_result = await db.execute(count_query)
+        total = count_result.scalar() or 0
+
+        # Early return if no results
+        if total == 0:
+            return {
+                "success": True,
+                "data": {
+                    "purchases": [],
+                    "pagination": {
+                        "total": 0,
+                        "page": page,
+                        "limit": limit,
+                        "totalPages": 0,
+                        "hasNext": False,
+                        "hasPrev": False
+                    },
+                    "todayBookings": today_bookings
+                }
+            }
+
+        # Build the final paginated query from the union result
+        final_query = (
+            select(
+                combined_query.c.id,
+                combined_query.c.client_id,
+                combined_query.c.gym_id,
+                combined_query.c.type,
+                combined_query.c.days_total,
+                combined_query.c.total_sessions,
+                combined_query.c.scheduled_sessions,
+                combined_query.c.amount,
+                combined_query.c.purchased_at,
+                combined_query.c.client_name,
+                combined_query.c.gym_name,
+                combined_query.c.gym_contact,
+                combined_query.c.owner_contact,
+                combined_query.c.owner_name,
+                combined_query.c.gym_area,
+                combined_query.c.gym_city,
+                combined_query.c.client_contact,
+                combined_query.c.platform,
+                combined_query.c.session_name,
+                combined_query.c.head_count,
+                combined_query.c.discount_price
+            )
+            .select_from(combined_query)
+            .order_by(combined_query.c.purchased_at.desc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+
+        # Apply type filter if provided
+        if type:
+            final_query = final_query.where(combined_query.c.type == type)
+
+        # Apply distinct client filter
+        if distinct_client_filter:
+            final_query = final_query.where(combined_query.c.client_name.in_(distinct_client_filter))
+
+        # Apply distinct gym filter
+        if distinct_gym_filter:
+            final_query = final_query.where(combined_query.c.gym_name.in_(distinct_gym_filter))
+
+        # Execute query (async, non-blocking)
+        result = await db.execute(final_query)
+        rows = result.all()
+
+        # Process scheduled_sessions to get unique dates count
+        def get_session_display(scheduled_sessions_json):
+            """Process scheduled_sessions JSON to get 'X / Y sessions' format."""
+            if not scheduled_sessions_json:
+                return None
+            try:
+                # Parse JSON string if needed
+                if isinstance(scheduled_sessions_json, str):
+                    sessions = json.loads(scheduled_sessions_json)
+                elif isinstance(scheduled_sessions_json, list):
+                    sessions = scheduled_sessions_json
+                else:
+                    return None
+
+                if not sessions:
+                    return None
+
+                total_sessions = len(sessions)
+                unique_dates = len(set(s.get("date") for s in sessions if s.get("date")))
+                return f"{unique_dates} / {total_sessions} sessions"
+            except Exception:
+                return None
+
+        # Extract session schedule (date and start_time only)
+        def get_session_schedule(scheduled_sessions_json):
+            """Extract date and start_time from scheduled_sessions."""
+            if not scheduled_sessions_json:
+                return []
+            try:
+                # Parse JSON string if needed
+                if isinstance(scheduled_sessions_json, str):
+                    sessions = json.loads(scheduled_sessions_json)
+                elif isinstance(scheduled_sessions_json, list):
+                    sessions = scheduled_sessions_json
+                else:
+                    return []
+
+                if not sessions:
+                    return []
+
+                return [
+                    {"date": s.get("date"), "start_time": s.get("start_time")}
+                    for s in sessions
+                    if s.get("date") and s.get("start_time")
+                ]
+            except Exception:
+                return []
+
+        # Fetch scheduled dates and status for daily passes and sessions
+        daily_pass_ids = [row.id for row in rows if row.type == "Daily Pass"]
+        session_ids = []
+        for row in rows:
+            if row.type == "Session":
+                try:
+                    session_ids.append(int(row.id))
+                except (ValueError, TypeError):
+                    session_ids.append(row.id)
+
+        daily_pass_dates = {}
+        daily_pass_statuses = {}
+        daily_pass_days_detailed = {}
+        if daily_pass_ids:
+            dp_dates_query = (
+                select(DailyPassDay.pass_id, DailyPassDay.scheduled_date, DailyPassDay.status, DailyPassDay.checkin_at)
+                .where(DailyPassDay.pass_id.in_(daily_pass_ids))
+                .order_by(DailyPassDay.scheduled_date)
+            )
+            dp_dates_result = await db.execute(dp_dates_query)
+            for dp_row in dp_dates_result.all():
+                pass_id = dp_row.pass_id
+                date_str = dp_row.scheduled_date.isoformat() if dp_row.scheduled_date else None
+                checkin_str = dp_row.checkin_at.isoformat() if dp_row.checkin_at else None
+                
+                daily_pass_dates.setdefault(pass_id, []).append(date_str)
+                
+                day_detail = {
+                    "date": date_str,
+                    "status": dp_row.status,
+                    "checkin_at": checkin_str
+                }
+                daily_pass_days_detailed.setdefault(pass_id, []).append(day_detail)
+                
+                # Collect all statuses for this pass
+                if pass_id not in daily_pass_statuses:
+                    daily_pass_statuses[pass_id] = []
+                if dp_row.status:
+                    daily_pass_statuses[pass_id].append(dp_row.status)
+
+        session_dates = {}
+        session_statuses = {}
+        session_days_detailed = {}
+        if session_ids:
+            sb_dates_query = (
+                select(SessionBookingDay.purchase_id, SessionBookingDay.booking_date, SessionBookingDay.status, SessionBookingDay.scanned_at)
+                .where(SessionBookingDay.purchase_id.in_(session_ids))
+                .order_by(SessionBookingDay.booking_date)
+            )
+            sb_dates_result = await db.execute(sb_dates_query)
+            sb_rows = sb_dates_result.all()
+            print(f"[ALL_PURCHASES] session_ids: {session_ids[:5]}... (showing first 5)")
+            print(f"[ALL_PURCHASES] SessionBookingDay query returned {len(sb_rows)} rows")
+            for sb_row in sb_rows:
+                purchase_id = sb_row.purchase_id
+                date_str = sb_row.booking_date.isoformat() if sb_row.booking_date else None
+                scanned_str = sb_row.scanned_at.isoformat() if sb_row.scanned_at else None
+                
+                session_dates.setdefault(purchase_id, []).append(date_str)
+                
+                day_detail = {
+                    "date": date_str,
+                    "status": sb_row.status,
+                    "checkin_at": scanned_str
+                }
+                session_days_detailed.setdefault(purchase_id, []).append(day_detail)
+                
+                # Collect all statuses for this purchase (status is always present)
+                if purchase_id not in session_statuses:
+                    session_statuses[purchase_id] = []
+                session_statuses[purchase_id].append(sb_row.status)
+            print(f"[ALL_PURCHASES] session_statuses keys: {list(session_statuses.keys())[:5]}... (showing first 5)")
+
+        # Helper function to determine overall status
+        # Priority: canceled > missed > rescheduled > scheduled > attended
+        def get_overall_status(statuses):
+            if not statuses:
+                return None
+
+            # Map database status values to frontend values
+            status_mapping = {
+                "booked": "scheduled",
+                "cancelled": "canceled",
+                "attended": "attended",
+                "no_show": "missed",
+                "refunded": "canceled"
+            }
+
+            # Map all statuses to frontend values
+            mapped_statuses = [status_mapping.get(s, s) for s in statuses]
+
+            status_priority = {
+                "canceled": 5,
+                "missed": 4,
+                "rescheduled": 3,
+                "scheduled": 2,
+                "attended": 1
+            }
+            # Return the status with highest priority
+            return max(mapped_statuses, key=lambda s: status_priority.get(s, 0))
+
+        # Format response
+        purchases = []
+        for row in rows:
+            purchase = {
+                "id": row.id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "gym_id": row.gym_id,
+                "gym_name": row.gym_name or "N/A",
+                "amount": float(row.amount) if row.amount else 0.0,
+                "purchased_at": row.purchased_at,
+                "type": row.type,
+                "gym_contact": row.gym_contact or None,
+                "owner_contact": row.owner_contact or None,
+                "owner_name": row.owner_name or "N/A",
+                "gym_area": row.gym_area or "N/A",
+                "gym_city": row.gym_city or None,
+                "client_contact": row.client_contact or None,
+                "platform": row.platform or None,
+                "head_count": row.head_count or 1,
+                "discount_price": float(row.discount_price) if row.discount_price is not None else None
+            }
+
+            if row.type == "Daily Pass":
+                purchase["days_total"] = row.days_total
+                purchase["session_display"] = None
+                purchase["session_schedule"] = []
+                purchase["scheduled_date"] = daily_pass_dates.get(row.id, [])
+                purchase["scheduled_days_detailed"] = daily_pass_days_detailed.get(row.id, [])
+                # Determine overall status for daily pass
+                statuses = daily_pass_statuses.get(row.id, [])
+                purchase["status"] = get_overall_status(statuses)
+            else:  # Session
+                purchase["days_total"] = None
+                purchase["session_display"] = get_session_display(row.scheduled_sessions)
+                purchase["session_schedule"] = get_session_schedule(row.scheduled_sessions)
+                
+                # Cast row.id to int for lookup in session dicts (since union query returns it as string,
+                # but SessionBookingDay.purchase_id is an integer)
+                try:
+                    session_key = int(row.id)
+                except (ValueError, TypeError):
+                    session_key = row.id
+
+                purchase["scheduled_date"] = session_dates.get(session_key, [])
+                purchase["scheduled_days_detailed"] = session_days_detailed.get(session_key, [])
+                purchase["session_name"] = row.session_name
+                # Determine overall status for session
+                statuses = session_statuses.get(session_key, [])
+                purchase["status"] = get_overall_status(statuses)
+
+            purchases.append(purchase)
+
+        # Calculate pagination info
+        total_pages = (total + limit - 1) // limit if total > 0 else 0
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        # Get distinct clients from sessions/daily passes (SQL aggregation)
+        session_client_counts = (
+            select(
+                combined_query.c.client_name,
+                func.count().label("booking_count")
+            )
+            .select_from(combined_query)
+            .where(combined_query.c.client_name.isnot(None))
+            .group_by(combined_query.c.client_name)
+        )
+        if type:
+            session_client_counts = session_client_counts.where(combined_query.c.type == type)
+
+        session_client_result = await db.execute(session_client_counts)
+        session_client_counts_map = {row.client_name: row.booking_count for row in session_client_result.all()}
+
+        # Get distinct gyms from sessions/daily passes (SQL aggregation)
+        session_gym_counts = (
+            select(
+                combined_query.c.gym_name,
+                func.count().label("booking_count")
+            )
+            .select_from(combined_query)
+            .where(combined_query.c.gym_name.isnot(None))
+            .group_by(combined_query.c.gym_name)
+        )
+        if type:
+            session_gym_counts = session_gym_counts.where(combined_query.c.type == type)
+
+        session_gym_result = await db.execute(session_gym_counts)
+        session_gym_counts_map = {row.gym_name: row.booking_count for row in session_gym_result.all()}
+
+        # Get distinct clients and gyms from gym memberships
+        # Fetch base data first, then aggregate with SQL
+
+        # Step 1: Fetch gym membership base data with date filters
+        gym_membership_data_query = (
+            select(
+                Order.customer_id.label("client_id"),
+                OrderItem.gym_id.label("gym_id"),
+                Order.order_metadata.label("order_metadata")
+            )
+            .select_from(Payment)
+            .join(Order, Order.id == Payment.order_id)
+            .join(OrderItem, OrderItem.order_id == Order.id)
+            .where(Payment.status == "captured")
+            .where(Order.status == "paid")
+            .where(OrderItem.gym_id.isnot(None))
+            .where(OrderItem.gym_id != "1")
+        )
+
+        # Apply date filters
+        if start_date_obj:
+            gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) >= start_date_obj)
+        if end_date_obj:
+            gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) <= end_date_obj)
+
+        gm_result = await db.execute(gym_membership_data_query)
+        gm_rows = gm_result.all()
+
+        # Step 2: Filter by metadata conditions (in Python - simpler than complex SQL JSON queries)
+        valid_client_ids = []
+        valid_gym_ids = []
+        for row in gm_rows:
+            metadata = row.order_metadata
+            if not metadata or not isinstance(metadata, dict):
+                continue
+
+            # Condition checks
+            condition1 = (
+                metadata.get("audit") and isinstance(metadata.get("audit"), dict) and
+                metadata["audit"].get("source") == "dailypass_checkout_api"
+            )
+            condition2 = (
+                metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                metadata["order_info"].get("flow") == "unified_gym_membership_with_sub"
+            )
+            condition3 = (
+                metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                metadata["order_info"].get("flow") == "unified_gym_membership_with_free_fittbot"
+            )
+
+            if condition1 or condition2 or condition3:
+                if row.client_id:
+                    try:
+                        valid_client_ids.append(int(row.client_id))
+                    except:
+                        pass
+                if row.gym_id and row.gym_id.isdigit():
+                    valid_gym_ids.append(int(row.gym_id))
+
+        # Step 3: Count using SQL aggregation with the filtered IDs
+        gm_client_counts_map = {}
+        if valid_client_ids:
+            gm_client_query = (
+                select(
+                    Client.name,
+                    func.count().label("gm_count")
+                )
+                .where(Client.client_id.in_(valid_client_ids))
+                .where(Client.name.isnot(None))
+                .group_by(Client.name)
+            )
+            gm_client_result = await db.execute(gm_client_query)
+            gm_client_counts_map = {row.name: row.gm_count for row in gm_client_result.all()}
+
+        gm_gym_counts_map = {}
+        if valid_gym_ids:
+            gm_gym_query = (
+                select(
+                    Gym.name,
+                    func.count().label("gm_count")
+                )
+                .where(Gym.gym_id.in_(valid_gym_ids))
+                .where(Gym.name.isnot(None))
+                .group_by(Gym.name)
+            )
+            gm_gym_result = await db.execute(gm_gym_query)
+            gm_gym_counts_map = {row.name: row.gm_count for row in gm_gym_result.all()}
+
+        # Merge counts from sessions/daily passes and gym memberships
+        final_distinct_clients = []
+        all_client_names = set(session_client_counts_map.keys()) | set(gm_client_counts_map.keys())
+        for client_name in all_client_names:
+            total_count = (
+                session_client_counts_map.get(client_name, 0) +
+                gm_client_counts_map.get(client_name, 0)
+            )
+            if total_count == 1:
+                final_distinct_clients.append(client_name)
+
+        final_distinct_gyms = []
+        all_gym_names = set(session_gym_counts_map.keys()) | set(gm_gym_counts_map.keys())
+        for gym_name in all_gym_names:
+            total_count = (
+                session_gym_counts_map.get(gym_name, 0) +
+                gm_gym_counts_map.get(gym_name, 0)
+            )
+            if total_count == 1:
+                final_distinct_gyms.append(gym_name)
+
+        return {
+            "success": True,
+            "data": {
+                "purchases": purchases,
+                "pagination": {
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": total_pages,
+                    "hasNext": has_next,
+                    "hasPrev": has_prev
+                },
+                "distinctClients": final_distinct_clients,
+                "distinctGyms": final_distinct_gyms,
+                "todayBookings": today_bookings
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in get_all_purchases: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while fetching purchases"
+        )
+
+
+@router.get("/booking-count")
+async def get_booking_count(
+    date_filter: Optional[str] = Query(default="today"),
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Get booking count using compute_actual_booking_counts from revenue_service."""
+    from datetime import datetime, timezone, timedelta
+    import calendar
+    from app.fittbot_admin_api.revenue_service import get_total_bookings_count
+
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(IST)
+        today = now.date()
+
+        if date_filter == "yesterday":
+            yesterday = today - timedelta(days=1)
+            start_date_obj = yesterday
+            end_date_obj = yesterday
+        elif date_filter == "last7days":
+            start_date_obj = today - timedelta(days=6)
+            end_date_obj = today
+        elif date_filter == "current_month":
+            start_date_obj = today.replace(day=1)
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            end_date_obj = today.replace(day=last_day)
+        elif date_filter == "last_month":
+            if today.month == 1:
+                first_day = today.replace(month=12, day=1, year=today.year - 1)
+            else:
+                first_day = today.replace(month=today.month - 1, day=1)
+            last_day = calendar.monthrange(first_day.year, first_day.month)[1]
+            start_date_obj = first_day
+            end_date_obj = first_day.replace(day=last_day)
+        elif date_filter == "overall":
+            start_date_obj = None
+            end_date_obj = None
+        elif date_filter == "custom" and start_time and end_time:
+            if 'T' in start_time:
+                start_date_obj = datetime.fromisoformat(start_time.replace('Z', '+00:00')).date()
+            else:
+                start_date_obj = datetime.fromisoformat(start_time).date()
+                
+            if 'T' in end_time:
+                end_date_obj = datetime.fromisoformat(end_time.replace('Z', '+00:00')).date()
+            else:
+                end_date_obj = datetime.fromisoformat(end_time).date()
+        else:
+            start_date_obj = today
+            end_date_obj = today
+
+        # Get centralized booking count
+        total_count = await get_total_bookings_count(db, start_date_obj, end_date_obj)
+
+        return {
+            "success": True,
+            "data": {
+                "booking_count": total_count
+            },
+            "message": "Booking count fetched successfully"
+        }
+
+    except Exception as e:
+        import logging
+        logging.error(f"[BOOKING-COUNT] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to fetch booking count: {str(e)}"
+        }
+
+
+async def compute_gmv_totals(db: AsyncSession, start_date_obj, end_date_obj):
+    """
+    Shared GMV aggregation helper.
+    Called by both /gmv-summary and /api/admin/unit-economics/data
+    so that both always return identical values.
+    """
+    EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+    # Daily Pass
+    dp_conditions = [DailyPass.gym_id != "1"]
+    if start_date_obj:
+        dp_conditions.append(func.date(DailyPass.created_at) >= start_date_obj)
+    if end_date_obj:
+        dp_conditions.append(func.date(DailyPass.created_at) <= end_date_obj)
+
+    dp_stmt = (
+        select(
+            func.coalesce(func.sum(DailyPass.days_total * DailyPass.head_count), 0).label("count"),
+            func.coalesce(func.sum(Payment.amount_minor / 100.0), 0).label("total_revenue")
+        )
+        .select_from(DailyPass)
+        .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+        .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+        .where(*dp_conditions)
+    )
+    dp_row = (await db.execute(dp_stmt)).one()
+
+    # Fitness Class (Session)
+    sess_conditions = [SessionPurchase.status == "paid", SessionPurchase.gym_id != 1]
+    if start_date_obj:
+        sess_conditions.append(func.date(SessionPurchase.created_at) >= start_date_obj)
+    if end_date_obj:
+        sess_conditions.append(func.date(SessionPurchase.created_at) <= end_date_obj)
+
+    sess_stmt = (
+        select(
+            func.coalesce(func.sum(SessionPurchase.sessions_count), 0).label("count"),
+            func.coalesce(func.sum(SessionPurchase.payable_rupees), 0).label("total_revenue")
+        )
+        .select_from(SessionPurchase)
+        .join(Gym, SessionPurchase.gym_id == Gym.gym_id)
+        .where(*sess_conditions)
+    )
+    sess_row = (await db.execute(sess_stmt)).one()
+
+    # Nutrition Plans
+    nutri_conditions = [
+        Payment.status == "captured",
+        or_(
+            func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_purchase_googleplay",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_package_razorpay",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "basic_nutrition_plan",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "expert_nutrition_plan",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "elite_nutrition_plan"
+        )
+    ]
+    if start_date_obj:
+        nutri_conditions.append(func.date(Payment.captured_at) >= start_date_obj)
+    if end_date_obj:
+        nutri_conditions.append(func.date(Payment.captured_at) <= end_date_obj)
+
+    nutri_stmt = (
+        select(
+            func.count(Payment.id).label("count"),
+            func.coalesce(func.sum(Payment.amount_minor / 100.0), 0).label("total_revenue")
+        )
+        .select_from(Payment)
+        .outerjoin(Client, Payment.customer_id == Client.client_id)
+        .join(
+            NutritionEligibility,
+            cast(Payment.order_id, String) == NutritionEligibility.source_id
+        )
+        .where(NutritionEligibility.source_type == "fymble_purchase")
+        .where(*nutri_conditions)
+        .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+    )
+    nutri_row = (await db.execute(nutri_stmt)).one()
+
+    # Gym Membership
+    gym_meta_cond = or_(
+        func.json_unquote(func.json_extract(Order.order_metadata, "$.audit.source")) == "dailypass_checkout_api",
+        func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_sub",
+        func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_free_fittbot",
+        func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "gym_membership_with_bonus_credits",
+        func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "personal_training_with_bonus_credits"
+    )
+    gym_exists = (
+        select(1)
+        .select_from(OrderItem)
+        .join(Gym, Gym.gym_id == cast(OrderItem.gym_id, Integer))
+        .where(
+            OrderItem.order_id == Order.id,
+            OrderItem.gym_id.isnot(None),
+            OrderItem.gym_id != "",
+            OrderItem.gym_id != "1"
+        )
+        .exists()
+    )
+    gym_conditions = [
+        Payment.status == "captured",
+        Order.status == "paid",
+        Order.customer_id.isnot(None),
+        gym_meta_cond,
+        gym_exists
+    ]
+    if start_date_obj:
+        gym_conditions.append(func.date(Payment.captured_at) >= start_date_obj)
+    if end_date_obj:
+        gym_conditions.append(func.date(Payment.captured_at) <= end_date_obj)
+
+    gym_subq = (
+        select(
+            Order.id.label("order_id"),
+            Order.gross_amount_minor.label("gross_amount_minor")
+        )
+        .select_from(Payment)
+        .join(Order, Order.id == Payment.order_id)
+        .join(Client, Client.client_id == cast(Order.customer_id, Integer))
+        .where(*gym_conditions)
+        .distinct()
+        .subquery()
+    )
+    gym_row = (await db.execute(
+        select(
+            func.count(gym_subq.c.order_id).label("count"),
+            func.coalesce(func.sum(gym_subq.c.gross_amount_minor) / 100.0, 0).label("total_revenue")
+        ).select_from(gym_subq)
+    )).one()
+
+    # AI Credits
+    ai_conditions = [
+        Payment.status == "captured",
+        or_(
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay"
+        )
+    ]
+    if start_date_obj:
+        ai_conditions.append(func.date(Payment.captured_at) >= start_date_obj)
+    if end_date_obj:
+        ai_conditions.append(func.date(Payment.captured_at) <= end_date_obj)
+
+    ai_row = (await db.execute(
+        select(
+            func.count(Payment.id).label("count"),
+            func.coalesce(func.sum(Payment.amount_minor / 100.0), 0).label("total_revenue")
+        )
+        .select_from(Payment)
+        .outerjoin(Client, Payment.customer_id == Client.client_id)
+        .where(*ai_conditions)
+        .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+    )).one()
+
+    # AI Diet Coach
+    ai_diet_conditions = [
+        Payment.status == "captured",
+        func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach"
+    ]
+    if start_date_obj:
+        ai_diet_conditions.append(func.date(Payment.captured_at) >= start_date_obj)
+    if end_date_obj:
+        ai_diet_conditions.append(func.date(Payment.captured_at) <= end_date_obj)
+
+    ai_diet_row = (await db.execute(
+        select(
+            func.count(Payment.id).label("count"),
+            func.coalesce(func.sum(Payment.amount_minor / 100.0), 0).label("total_revenue")
+        )
+        .select_from(Payment)
+        .outerjoin(Client, Payment.customer_id == Client.client_id)
+        .where(*ai_diet_conditions)
+        .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+    )).one()
+
+    return {
+        "daily_pass":     {"count": dp_row.count,    "total_revenue": float(dp_row.total_revenue)},
+        "session":        {"count": sess_row.count,  "total_revenue": float(sess_row.total_revenue)},
+        "nutrition_plan": {"count": nutri_row.count, "total_revenue": float(nutri_row.total_revenue)},
+        "gym_membership": {"count": gym_row.count,   "total_revenue": float(gym_row.total_revenue)},
+        "ai_credits":     {"count": ai_row.count,    "total_revenue": float(ai_row.total_revenue)},
+        "ai_diet_coach":  {"count": ai_diet_row.count, "total_revenue": float(ai_diet_row.total_revenue)},
+    }
+
+
+@router.get("/gmv-summary")
+async def get_gmv_summary(
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    GMV summary: delegates to compute_gmv_totals() shared helper
+    so unit-economics page returns identical values.
+    """
+    try:
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        data = await compute_gmv_totals(db, start_date_obj, end_date_obj)
+        return {"success": True, "data": data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in get_gmv_summary: {str(e)}")
+        raise HTTPException(status_code=500, detail="An error occurred while fetching GMV summary")
+
+
+@router.get("/purchase-count-summary")
+async def get_purchase_count_summary(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=200),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get per-client purchase counts across all categories.
+    Follows logic from compute_gmv_totals regarding valid purchases.
+    """
+    try:
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        # 1. Individual Streams
+        # Daily Pass (Option A: Days × Headcount)
+        dp_stream = (
+            select(
+                cast(DailyPass.client_id, Integer).label("client_id"),
+                literal("pass_or_session").label("source_category"),
+                func.coalesce(DailyPass.days_total * DailyPass.head_count, 1).label("purchase_weight")
+            )
+            .where(or_(DailyPass.gym_id != "1", DailyPass.gym_id.is_(None)))
+        )
+
+        # Sessions (sessions_count)
+        sess_stream = (
+            select(
+                SessionPurchase.client_id,
+                literal("pass_or_session").label("source_category"),
+                func.coalesce(SessionPurchase.sessions_count, 1).label("purchase_weight")
+            )
+            .where(SessionPurchase.status == "paid", or_(SessionPurchase.gym_id != 1, SessionPurchase.gym_id.is_(None)))
+        )
+
+        # Nutrition (Payments)
+        nutri_stream = (
+            select(
+                Payment.customer_id.label("client_id"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(
+                Payment.status == "captured",
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_purchase_googleplay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_package_razorpay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "basic_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "expert_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "elite_nutrition_plan"
+                ),
+                ~Client.contact.in_(EXCLUDED_CONTACTS)
+            )
+        )
+
+        # AI Credits & AI Diet Coach
+        ai_stream = (
+            select(
+                Payment.customer_id.label("client_id"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(
+                Payment.status == "captured",
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach"
+                ),
+                ~Client.contact.in_(EXCLUDED_CONTACTS)
+            )
+        )
+
+        # Gym Membership (Orders)
+        gym_meta_cond = or_(
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.audit.source")) == "dailypass_checkout_api",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_sub",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_free_fittbot"
+        )
+        gym_exists = (
+            select(1)
+            .select_from(OrderItem)
+            .where(
+                OrderItem.order_id == Order.id,
+                OrderItem.gym_id.isnot(None),
+                OrderItem.gym_id != "",
+                OrderItem.gym_id != "1"
+            )
+            .exists()
+        )
+        gm_stream = (
+            select(
+                cast(Order.customer_id, Integer).label("client_id"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .select_from(Payment)
+            .join(Order, Order.id == Payment.order_id)
+            .join(Client, Client.client_id == cast(Order.customer_id, Integer))
+            .where(
+                Payment.status == "captured",
+                Order.status == "paid",
+                Order.customer_id.isnot(None),
+                gym_meta_cond,
+                gym_exists,
+                ~Client.contact.in_(EXCLUDED_CONTACTS)
+            )
+        )
+
+        # 2. Unified Purchase Events
+        unified_purchases = union_all(
+            dp_stream,
+            sess_stream,
+            nutri_stream,
+            ai_stream,
+            gm_stream
+        ).alias("unified_purchases")
+
+        # 3. Aggregate per Client
+        agg_query = (
+            select(
+                unified_purchases.c.client_id,
+                func.sum(unified_purchases.c.purchase_weight).label("total_purchases"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+                Client.profile.label("dp")
+            )
+            .join(Client, Client.client_id == unified_purchases.c.client_id)
+            .where(
+                or_(
+                    unified_purchases.c.source_category == "pass_or_session",
+                    ~Client.contact.in_(EXCLUDED_CONTACTS)
+                )
+            )
+            .group_by(unified_purchases.c.client_id, Client.name, Client.contact, Client.profile)
+            .order_by(desc(func.sum(unified_purchases.c.purchase_weight)))
+        )
+
+        if search:
+            agg_query = agg_query.where(
+                or_(
+                    Client.name.ilike(f"%{search}%"),
+                    Client.contact.ilike(f"%{search}%")
+                )
+            )
+
+        # 4. Count Total Unique Clients in purchases
+        total_stmt = select(func.count()).select_from(agg_query.subquery())
+        total_count = await db.scalar(total_stmt) or 0
+
+        # 5. Fetch Paginated
+        offset = (page - 1) * limit
+        agg_query = agg_query.offset(offset).limit(limit)
+        
+        result = await db.execute(agg_query)
+        rows = result.all()
+
+        data = [
+            {
+                "client_id": r.client_id,
+                "client_name": r.client_name or "Unknown",
+                "client_contact": r.client_contact or "N/A",
+                "dp": r.dp,
+                "total_purchases": int(r.total_purchases or 0)
+            }
+            for r in rows
+        ]
+
+        return {
+            "success": True,
+            "data": data,
+            "pagination": {
+                "total": total_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": (total_count + limit - 1) // limit if total_count > 0 else 0
+            }
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/export-purchase-count-summary")
+async def export_purchase_count_summary(
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export per-client purchase counts and details to Excel.
+    Columns: S.No, Client Name, Client Mobile, No. of Bookings, Gym name, Booking Dates, Total Amount.
+    """
+    try:
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        # 1. Individual detailed streams
+        # Daily Pass (Option A: Days × Headcount)
+        dp_stream = (
+            select(
+                cast(DailyPass.client_id, Integer).label("client_id"),
+                (Payment.amount_minor / 100.0).label("amount"),
+                Gym.name.label("gym_name"),
+                func.date(DailyPass.created_at).label("booking_date"),
+                literal("Daily Pass").label("type"),
+                literal("pass_or_session").label("source_category"),
+                func.coalesce(DailyPass.days_total * DailyPass.head_count, 1).label("purchase_weight")
+            )
+            .select_from(DailyPass)
+            .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+            .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+            .where(or_(DailyPass.gym_id != "1", DailyPass.gym_id.is_(None)))
+        )
+
+        # Sessions (sessions_count)
+        sess_stream = (
+            select(
+                SessionPurchase.client_id,
+                SessionPurchase.payable_rupees.label("amount"),
+                Gym.name.label("gym_name"),
+                func.date(SessionPurchase.created_at).label("booking_date"),
+                literal("Session").label("type"),
+                literal("pass_or_session").label("source_category"),
+                func.coalesce(SessionPurchase.sessions_count, 1).label("purchase_weight")
+            )
+            .select_from(SessionPurchase)
+            .join(Gym, SessionPurchase.gym_id == Gym.gym_id)
+            .where(SessionPurchase.status == "paid", or_(SessionPurchase.gym_id != 1, SessionPurchase.gym_id.is_(None)))
+        )
+
+        # Nutrition
+        nutri_stream = (
+            select(
+                Payment.customer_id.label("client_id"),
+                (Payment.amount_minor / 100.0).label("amount"),
+                literal("Nutrition Service").label("gym_name"),
+                func.date(Payment.captured_at).label("booking_date"),
+                literal("Nutrition").label("type"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(
+                Payment.status == "captured",
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_purchase_googleplay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_package_razorpay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "basic_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "expert_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "elite_nutrition_plan"
+                ),
+                ~Client.contact.in_(EXCLUDED_CONTACTS)
+            )
+        )
+
+        # AI Credits & AI Diet Coach
+        ai_stream = (
+            select(
+                Payment.customer_id.label("client_id"),
+                (Payment.amount_minor / 100.0).label("amount"),
+                literal("AI Service").label("gym_name"),
+                func.date(Payment.captured_at).label("booking_date"),
+                literal("AI Credits").label("type"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(
+                Payment.status == "captured",
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach"
+                ),
+                ~Client.contact.in_(EXCLUDED_CONTACTS)
+            )
+        )
+
+        # Gym Membership
+        gym_meta_cond = or_(
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.audit.source")) == "dailypass_checkout_api",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_sub",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_free_fittbot"
+        )
+        gym_exists_join = (
+            select(OrderItem.order_id, Gym.name.label("gym_name"))
+            .join(Gym, Gym.gym_id == cast(OrderItem.gym_id, Integer))
+            .where(OrderItem.gym_id != "1")
+            .alias("gym_info")
+        )
+        
+        gm_stream = (
+            select(
+                cast(Order.customer_id, Integer).label("client_id"),
+                (Order.gross_amount_minor / 100.0).label("amount"),
+                gym_exists_join.c.gym_name,
+                func.date(Payment.captured_at).label("booking_date"),
+                literal("Membership").label("type"),
+                literal("other").label("source_category"),
+                literal(1).label("purchase_weight")
+            )
+            .select_from(Payment)
+            .join(Order, Order.id == Payment.order_id)
+            .join(gym_exists_join, gym_exists_join.c.order_id == Order.id)
+            .join(Client, Client.client_id == cast(Order.customer_id, Integer))
+            .where(
+                Payment.status == "captured",
+                Order.status == "paid",
+                ~Client.contact.in_(EXCLUDED_CONTACTS),
+                gym_meta_cond
+            )
+        )
+
+        unified_detailed = union_all(
+            dp_stream,
+            sess_stream,
+            nutri_stream,
+            ai_stream,
+            gm_stream
+        ).alias("unified_detailed")
+
+        # Join with Client for name and contact
+        full_query = (
+            select(
+                unified_detailed.c.client_id,
+                unified_detailed.c.amount,
+                unified_detailed.c.gym_name,
+                unified_detailed.c.booking_date,
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+                unified_detailed.c.purchase_weight
+            )
+            .join(Client, Client.client_id == unified_detailed.c.client_id)
+            .where(
+                or_(
+                    unified_detailed.c.source_category == "pass_or_session",
+                    ~Client.contact.in_(EXCLUDED_CONTACTS)
+                )
+            )
+        )
+
+        if search:
+            full_query = full_query.where(
+                or_(
+                    Client.name.ilike(f"%{search}%"),
+                    Client.contact.ilike(f"%{search}%")
+                )
+            )
+
+        result = await db.execute(full_query)
+        rows = result.all()
+
+        # 2. Aggregate in Python for complex concatenation
+        aggregated_data = {}
+        for r in rows:
+            cid = r.client_id
+            if cid not in aggregated_data:
+                aggregated_data[cid] = {
+                    "client_name": r.client_name or "Unknown",
+                    "client_mobile": r.client_contact or "N/A",
+                    "num_bookings": 0,
+                    "gym_names": set(),
+                    "booking_dates": set(),
+                    "total_amount": 0.0
+                }
+            
+            agg = aggregated_data[cid]
+            agg["num_bookings"] += int(r.purchase_weight or 1)
+            if r.gym_name:
+                agg["gym_names"].add(r.gym_name)
+            if r.booking_date:
+                # Handle both datetime and string
+                if hasattr(r.booking_date, 'strftime'):
+                    agg["booking_dates"].add(r.booking_date.strftime("%Y-%m-%d"))
+                else:
+                    agg["booking_dates"].add(str(r.booking_date))
+            agg["total_amount"] += float(r.amount or 0)
+
+        # 3. Create Excel
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Purchase Summary"
+
+        headers = ["S.No", "Client Name", "Client Mobile", "No. of Bookings", "Gym Name", "Booking Dates", "Total Amount"]
+        ws.append(headers)
+
+        # Style header
+        header_fill = PatternFill(start_color="FF5757", end_color="FF5757", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Sort aggregated data by number of bookings descending
+        sorted_clients = sorted(aggregated_data.values(), key=lambda x: x["num_bookings"], reverse=True)
+
+        for i, client in enumerate(sorted_clients, 1):
+            ws.append([
+                i,
+                client["client_name"],
+                client["client_mobile"],
+                client["num_bookings"],
+                ", ".join(sorted(list(client["gym_names"]))),
+                ", ".join(sorted(list(client["booking_dates"]))),
+                f"₹{client['total_amount']:.2f}"
+            ])
+
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except: pass
+            ws.column_dimensions[column_letter].width = min(max_length + 2, 60)
+
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"client_purchase_summary_{timestamp}.xlsx"
+
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export error: {str(e)}")
+
+@router.get("/ai-credits")
+async def get_ai_credits(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name or mobile"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    sort_order: str = Query("desc", description="Sort order for purchase date"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get list of AI Credits purchases.
+    Fetches from payments.payments table where payment_metadata['flow'] is 'food_scanner_credits' or 'food_scanner_credits_razorpay'.
+    Checks flow at two nesting levels: direct $.flow or $.order_info.flow.
+    Same logic as revenue_service.get_ai_credits_revenue() but as a paginated listing.
+    """
+    try:
+        import math
+
+        # Parse dates
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        # Metadata filter: $.flow == 'food_scanner_credits' or 'food_scanner_credits_razorpay' (exact match)
+        # The data looks like: {"flow": "food_scanner_credits", ...}
+        ai_flow_cond = or_(
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay"
+        )
+
+        # Excluded internal/test contacts (same list as nutrition plans and GMV)
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        # Base query
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Payment.payment_metadata.label("payment_metadata"),
+                Client.client_id.label("client_id"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(Payment.status == "captured")
+            .where(ai_flow_cond)
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        # Date filters
+        if start_date_obj:
+            query = query.where(func.date(Payment.captured_at) >= start_date_obj)
+        if end_date_obj:
+            query = query.where(func.date(Payment.captured_at) <= end_date_obj)
+
+        # Search filter
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        # Total count
+        count_subquery = query.subquery()
+        count_stmt = select(func.count()).select_from(count_subquery)
+        count_result = await db.execute(count_stmt)
+        total_count = count_result.scalar() or 0
+
+        if total_count == 0:
+            return {
+                "success": True,
+                "data": {
+                    "purchases": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": 0,
+                    "hasNext": False,
+                    "hasPrev": False
+                },
+                "message": "No AI credits purchases found"
+            }
+
+        # Sort
+        if sort_order == "asc":
+            query = query.order_by(asc(Payment.captured_at))
+        else:
+            query = query.order_by(desc(Payment.captured_at))
+
+        # Paginate
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        purchases = []
+        for row in rows:
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d") if row.purchased_at else "N/A"
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+
+            # Extract pack/credits info from payment_metadata if present
+            pack_info = "N/A"
+            if row.payment_metadata and isinstance(row.payment_metadata, dict):
+                meta = row.payment_metadata
+                # Try direct keys first
+                for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                    if key in meta:
+                        pack_info = str(meta[key])
+                        break
+                # Try under order_info
+                if pack_info == "N/A" and isinstance(meta.get("order_info"), dict):
+                    for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                        if key in meta["order_info"]:
+                            pack_info = str(meta["order_info"][key])
+                            break
+
+            purchases.append({
+                "id": row.purchase_id,
+                "customer_id": row.customer_id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "mobile": row.client_contact or "N/A",
+                "purchased_date": purchased_date,
+                "amount": amount_rupees,
+                "pack_info": pack_info,
+            })
+
+        total_pages = math.ceil(total_count / limit)
+
+        return {
+            "success": True,
+            "data": {
+                "purchases": purchases,
+                "total": total_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": total_pages,
+                "hasNext": page < total_pages,
+                "hasPrev": page > 1
+            },
+            "message": "AI credits purchases fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching AI credits purchases: {str(e)}"
+        )
+
+
+@router.get("/ai-diet-coach")
+async def get_ai_diet_coach(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name or mobile"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    sort_order: str = Query("desc", description="Sort order for purchase date"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get list of AI Diet Coach purchases.
+    Fetches from payments.payments table where payment_metadata['flow'] is 'ai_diet_coach'.
+    """
+    try:
+        import math
+
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        ai_flow_cond = (func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach")
+
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Payment.payment_metadata.label("payment_metadata"),
+                Client.client_id.label("client_id"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(Payment.status == "captured")
+            .where(ai_flow_cond)
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if start_date_obj:
+            query = query.where(func.date(Payment.captured_at) >= start_date_obj)
+        if end_date_obj:
+            query = query.where(func.date(Payment.captured_at) <= end_date_obj)
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        count_subquery = query.subquery()
+        count_stmt = select(func.count()).select_from(count_subquery)
+        count_result = await db.execute(count_stmt)
+        total_count = count_result.scalar() or 0
+
+        if total_count == 0:
+            return {
+                "success": True,
+                "data": {
+                    "purchases": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": 0,
+                    "hasNext": False,
+                    "hasPrev": False
+                },
+                "message": "No AI diet coach purchases found"
+            }
+
+        if sort_order == "asc":
+            query = query.order_by(asc(Payment.captured_at))
+        else:
+            query = query.order_by(desc(Payment.captured_at))
+
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        purchases = []
+        for row in rows:
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d") if row.purchased_at else "N/A"
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+
+            pack_info = "N/A"
+            if row.payment_metadata and isinstance(row.payment_metadata, dict):
+                meta = row.payment_metadata
+                for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                    if key in meta:
+                        pack_info = str(meta[key])
+                        break
+                if pack_info == "N/A" and isinstance(meta.get("order_info"), dict):
+                    for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                        if key in meta["order_info"]:
+                            pack_info = str(meta["order_info"][key])
+                            break
+
+            purchases.append({
+                "id": row.purchase_id,
+                "customer_id": row.customer_id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "mobile": row.client_contact or "N/A",
+                "purchased_date": purchased_date,
+                "amount": amount_rupees,
+                "pack_info": pack_info,
+            })
+
+        total_pages = math.ceil(total_count / limit)
+
+        return {
+            "success": True,
+            "data": {
+                "purchases": purchases,
+                "total": total_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": total_pages,
+                "hasNext": page < total_pages,
+                "hasPrev": page > 1
+            },
+            "message": "AI diet coach purchases fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching AI diet coach purchases: {str(e)}"
+        )
+
+
+@router.get("/ai-diet-coach")
+async def get_ai_diet_coach(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name or mobile"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    sort_order: str = Query("desc", description="Sort order for purchase date"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get list of AI Diet Coach purchases.
+    Fetches from payments.payments table where payment_metadata['flow'] is 'ai_diet_coach'.
+    """
+    try:
+        import math
+
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        ai_flow_cond = (func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach")
+
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Payment.payment_metadata.label("payment_metadata"),
+                Client.client_id.label("client_id"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(Payment.status == "captured")
+            .where(ai_flow_cond)
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if start_date_obj:
+            query = query.where(func.date(Payment.captured_at) >= start_date_obj)
+        if end_date_obj:
+            query = query.where(func.date(Payment.captured_at) <= end_date_obj)
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        count_subquery = query.subquery()
+        count_stmt = select(func.count()).select_from(count_subquery)
+        count_result = await db.execute(count_stmt)
+        total_count = count_result.scalar() or 0
+
+        if total_count == 0:
+            return {
+                "success": True,
+                "data": {
+                    "purchases": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": 0,
+                    "hasNext": False,
+                    "hasPrev": False
+                },
+                "message": "No AI diet coach purchases found"
+            }
+
+        if sort_order == "asc":
+            query = query.order_by(asc(Payment.captured_at))
+        else:
+            query = query.order_by(desc(Payment.captured_at))
+
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        purchases = []
+        for row in rows:
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d") if row.purchased_at else "N/A"
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+
+            pack_info = "N/A"
+            if row.payment_metadata and isinstance(row.payment_metadata, dict):
+                meta = row.payment_metadata
+                for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                    if key in meta:
+                        pack_info = str(meta[key])
+                        break
+                if pack_info == "N/A" and isinstance(meta.get("order_info"), dict):
+                    for key in ("credits", "pack", "plan", "pack_name", "credit_count"):
+                        if key in meta["order_info"]:
+                            pack_info = str(meta["order_info"][key])
+                            break
+
+            purchases.append({
+                "id": row.purchase_id,
+                "customer_id": row.customer_id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "mobile": row.client_contact or "N/A",
+                "purchased_date": purchased_date,
+                "amount": amount_rupees,
+                "pack_info": pack_info,
+            })
+
+        total_pages = math.ceil(total_count / limit)
+
+        return {
+            "success": True,
+            "data": {
+                "purchases": purchases,
+                "total": total_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": total_pages,
+                "hasNext": page < total_pages,
+                "hasPrev": page > 1
+            },
+            "message": "AI diet coach purchases fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching AI diet coach purchases: {str(e)}"
+        )
+
+
+@router.get("/today-schedule")
+async def get_today_schedule(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    db: AsyncSession = Depends(get_async_db)
+):
+   
+    try:
+        today = date.today()
+
+        # Build DailyPassDay subquery with type label
+        daily_pass_query = (
+            select(
+                DailyPassDay.id,
+                DailyPassDay.scheduled_date.label("booking_date"),
+                DailyPassDay.status.label("day_status"),
+                DailyPassDay.checkin_at.label("checkin_at"),
+                DailyPass.days_total,
+                (Payment.amount_minor / 100.0).label("amount"),
+                DailyPass.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Client.platform.label("platform"),
+                literal("Daily Pass").label("type"),
+                literal(None).label("session_name"),
+            )
+            .select_from(DailyPassDay)
+            .join(DailyPass, DailyPassDay.pass_id == DailyPass.id)
+            .outerjoin(Client, cast(DailyPassDay.client_id, Integer) == Client.client_id)
+            .outerjoin(Gym, cast(DailyPassDay.gym_id, Integer) == Gym.gym_id)
+            .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+            .where(DailyPassDay.scheduled_date == today)
+            .where(DailyPassDay.gym_id != 1)  # Exclude gym_id = 1
+        )
+
+        # Build SessionBookingDay subquery with type label
+        session_booking_query = (
+            select(
+                SessionBookingDay.id,
+                SessionBookingDay.booking_date,
+                SessionBookingDay.status.label("day_status"),
+                SessionBookingDay.scanned_at.label("checkin_at"),
+                literal(None).label("days_total"),
+                SessionPurchase.payable_rupees.label("amount"),
+                SessionPurchase.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Client.platform.label("platform"),
+                literal("Session").label("type"),
+                ClassSession.name.label("session_name")
+            )
+            .select_from(SessionBookingDay)
+            .join(SessionPurchase, SessionBookingDay.purchase_id == SessionPurchase.id)
+            .join(ClassSession, SessionPurchase.session_id == ClassSession.id)
+            .outerjoin(Client, SessionBookingDay.client_id == Client.client_id)
+            .outerjoin(Gym, SessionBookingDay.gym_id == Gym.gym_id)
+            .where(SessionBookingDay.booking_date == today)
+            .where(SessionBookingDay.gym_id != 1)  # Exclude gym_id = 1
+        )
+
+        # Combine both queries with UNION ALL
+        combined_query = union_all(daily_pass_query, session_booking_query).alias("combined_schedule")
+
+        # Count total records for pagination
+        count_query = select(func.count()).select_from(combined_query)
+        count_result = await db.execute(count_query)
+        total = count_result.scalar() or 0
+
+        # Early return if no results
+        if total == 0:
+            return {
+                "success": True,
+                "data": {
+                    "schedule": [],
+                    "date": today.isoformat(),
+                    "pagination": {
+                        "total": 0,
+                        "page": page,
+                        "limit": limit,
+                        "totalPages": 0,
+                        "hasNext": False,
+                        "hasPrev": False
+                    }
+                }
+            }
+
+        # Build the final paginated query from the union result
+        final_query = (
+            select(
+                combined_query.c.id,
+                combined_query.c.booking_date,
+                combined_query.c.day_status,
+                combined_query.c.checkin_at,
+                combined_query.c.days_total,
+                combined_query.c.amount,
+                combined_query.c.purchased_at,
+                combined_query.c.client_name,
+                combined_query.c.gym_name,
+                combined_query.c.platform,
+                combined_query.c.type,
+                combined_query.c.session_name
+            )
+            .select_from(combined_query)
+            .order_by(combined_query.c.booking_date.desc(), combined_query.c.purchased_at.desc())
+            .offset((page - 1) * limit)
+            .limit(limit)
+        )
+
+        result = await db.execute(final_query)
+        rows = result.all()
+
+        # Format response
+        schedule = [
+            {
+                "id": row.id,
+                "client_name": row.client_name or "N/A",
+                "gym_name": row.gym_name or "N/A",
+                "scheduled_date": row.booking_date.isoformat() if row.booking_date else None,
+                "status": row.day_status,
+                "checkin_at": row.checkin_at.isoformat() if row.checkin_at else None,
+                "days_total": row.days_total,
+                "amount": float(row.amount) if row.amount else 0.0,
+                "purchased_at": row.purchased_at,
+                "type": row.type,
+                "platform": row.platform,
+                "session_name": row.session_name if row.type == "Session" else None
+            }
+            for row in rows
+        ]
+
+        # Calculate pagination info
+        total_pages = (total + limit - 1) // limit if total > 0 else 0
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        return {
+            "success": True,
+            "data": {
+                "schedule": schedule,
+                "date": today.isoformat(),
+                "pagination": {
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": total_pages,
+                    "hasNext": has_next,
+                    "hasPrev": has_prev
+                }
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in get_today_schedule: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while fetching today's schedule"
+        )
+
+
+@router.get("/gym-memberships")
+async def get_gym_memberships(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name, contact, or gym name"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    distinct_clients: Optional[bool] = Query(False, description="Show only distinct clients (1 booking across all types)"),
+    distinct_gyms: Optional[bool] = Query(False, description="Show only distinct gyms (1 booking across all types)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get all gym memberships with pagination.
+    Using same logic as Financials/Revenue Analytics APIs (Order-based approach).
+    Excludes gym_id = 1, rows where client_id is not in clients table,
+    and rows where gym_id is not in gyms table.
+    """
+    try:
+        # Parse dates if provided
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+        # Fetch all gym memberships using Order-based approach (same as Financials API)
+        gym_membership_stmt = (
+            select(Payment, Order)
+            .join(Order, Order.id == Payment.order_id)
+            .where(Payment.status == "captured")
+            .where(Order.status == "paid")
+        )
+        gym_membership_result = await db.execute(gym_membership_stmt)
+        all_payments = gym_membership_result.all()
+
+        # Collect order IDs to fetch gym info from order_items (exclude gym_id = 1)
+        order_ids = [row.Order.id for row in all_payments]
+
+        # Fetch order items to get gym_ids (exclude gym_id = 1)
+        order_gym_mapping = {}
+        order_gym_id_mapping = {}  # Store actual gym_id values
+        order_item_id_mapping = {}  # Store mapping from order_id to order_item_id for entitlement lookup
+        if order_ids:
+            order_items_stmt = (
+                select(OrderItem)
+                .where(OrderItem.order_id.in_(order_ids))
+                .where(OrderItem.gym_id.isnot(None))
+                .where(OrderItem.gym_id != "1")
+            )
+            order_items_result = await db.execute(order_items_stmt)
+            order_items = order_items_result.scalars().all()
+
+            # Create mapping from order_id to gym_id and order_item_id
+            for item in order_items:
+                if item.gym_id and item.gym_id.strip() and item.gym_id.isdigit():
+                    order_gym_mapping[item.order_id] = int(item.gym_id)
+                    order_gym_id_mapping[item.order_id] = item.gym_id
+                    order_item_id_mapping[item.order_id] = item.id
+
+            # Fetch entitlements for these order_items to get status, joined_at, expire_at from fittbot_gym_membership table
+            order_item_ids = [item.id for item in order_items]
+            entitlements_mapping = {}
+            if order_item_ids:
+                entitlements_stmt = (
+                    select(Entitlement)
+                    .where(Entitlement.order_item_id.in_(order_item_ids))
+                )
+                entitlements_result = await db.execute(entitlements_stmt)
+                entitlements = entitlements_result.scalars().all()
+
+                # Collect entitlement IDs
+                ent_ids = [ent.id for ent in entitlements if ent.id]
+                fittbot_memberships_mapping = {}
+                if ent_ids:
+                    fittbot_stmt = (
+                        select(FittbotGymMembership)
+                        .where(FittbotGymMembership.entitlement_id.in_(ent_ids))
+                    )
+                    fittbot_result = await db.execute(fittbot_stmt)
+                    fittbot_memberships = fittbot_result.scalars().all()
+                    for fm in fittbot_memberships:
+                        fittbot_memberships_mapping[fm.entitlement_id] = {
+                            "status": fm.status,
+                            "joined_at": fm.joined_at,
+                            "expire_at": fm.expires_at
+                        }
+
+                for ent in entitlements:
+                    fm_data = fittbot_memberships_mapping.get(ent.id) if ent.id else None
+                    if fm_data:
+                        entitlements_mapping[ent.order_item_id] = {
+                            "status": fm_data["status"] or "N/A",
+                            "joined_at": fm_data["joined_at"],
+                            "expire_at": fm_data["expire_at"]
+                        }
+                    else:
+                        entitlements_mapping[ent.order_item_id] = {
+                            "status": "N/A",
+                            "joined_at": None,
+                            "expire_at": None
+                        }
+
+        # Filter by metadata conditions and collect valid orders
+        valid_orders = []
+        for row in all_payments:
+            payment = row.Payment
+            order = row.Order
+
+            # Check order_metadata for specific conditions (same as Financials/Revenue Analytics)
+            if not order.order_metadata or not isinstance(order.order_metadata, dict):
+                continue
+
+            metadata = order.order_metadata
+
+            # Condition 1: audit.source = "dailypass_checkout_api"
+            condition1 = False
+            if metadata.get("audit") and isinstance(metadata.get("audit"), dict):
+                if metadata["audit"].get("source") == "dailypass_checkout_api":
+                    condition1 = True
+
+            # Condition 2: order_info.flow = "unified_gym_membership_with_sub"
+            condition2 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "unified_gym_membership_with_sub":
+                    condition2 = True
+
+            # Condition 3: order_info.flow = "unified_gym_membership_with_free_fittbot"
+            condition3 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "unified_gym_membership_with_free_fittbot":
+                    condition3 = True
+
+            # Condition 4: order_info.flow = "gym_membership_with_bonus_credits"
+            condition4 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "gym_membership_with_bonus_credits":
+                    condition4 = True
+
+            # Condition 5: order_info.flow = "personal_training_with_bonus_credits"
+            condition5 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "personal_training_with_bonus_credits":
+                    condition5 = True
+
+            # Only include if any condition matches AND order has valid gym_id (not gym_id = 1)
+            if not (condition1 or condition2 or condition3 or condition4 or condition5):
+                continue
+
+            if order.id not in order_gym_mapping:
+                continue
+
+            valid_orders.append({
+                "order": order,
+                "payment": payment,
+                "gym_id": order_gym_id_mapping[order.id]
+            })
+
+        # Apply date filters if provided
+        if start_date_obj or end_date_obj:
+            filtered_orders = []
+            for item in valid_orders:
+                purchase_date = item["order"].created_at.date() if hasattr(item["order"].created_at, 'date') else item["order"].created_at
+                if start_date_obj and purchase_date < start_date_obj:
+                    continue
+                if end_date_obj and purchase_date > end_date_obj:
+                    continue
+                filtered_orders.append(item)
+            valid_orders = filtered_orders
+
+        # ── Validate ALL orders (client + gym must exist) to get the TRUE count ──
+        # Previously total was set before this check, causing count mismatch (e.g 34 vs 4)
+        validated_orders = []
+        for item in valid_orders:
+            order = item["order"]
+            gym_id_str = item["gym_id"]
+
+            if not order.customer_id:
+                continue
+
+            # Client must exist
+            client_stmt = select(Client).where(Client.client_id == int(order.customer_id))
+            client_result = await db.execute(client_stmt)
+            client = client_result.scalar_one_or_none()
+            if not client:
+                continue
+
+            # Gym must exist
+            if not gym_id_str or not gym_id_str.isdigit():
+                continue
+            gym_stmt = select(Gym).where(Gym.gym_id == int(gym_id_str))
+            gym_result = await db.execute(gym_stmt)
+            gym = gym_result.scalar_one_or_none()
+            if not gym:
+                continue
+
+            # Cache resolved objects to avoid re-fetching during pagination
+            item["_client"] = client
+            item["_gym"] = gym
+            validated_orders.append(item)
+
+        # TRUE count — only orders that physically have a matching client + gym
+        total = len(validated_orders)
+
+        # Early return if no results
+        if total == 0:
+            return {
+                "success": True,
+                "data": {
+                    "memberships": [],
+                    "pagination": {
+                        "total": 0,
+                        "page": page,
+                        "limit": limit,
+                        "totalPages": 0,
+                        "hasNext": False,
+                        "hasPrev": False
+                    }
+                }
+            }
+
+        # Sort validated_orders by captured date desc
+        validated_orders.sort(key=lambda x: x["order"].created_at, reverse=True)
+
+        # Build full membership rows (without triggering N+1 owner queries)
+        memberships = []
+        for item in validated_orders:
+            order = item["order"]
+            client = item["_client"]
+            gym = item["_gym"]
+
+            client_name = client.name or "N/A"
+            client_contact = client.contact
+            gym_name = gym.name or "N/A"
+            gym_contact = gym.contact_number
+            gym_area = gym.area or "N/A"
+            gym_city = gym.city or None
+
+            # Get entitlement data for this order
+            order_item_id = order_item_id_mapping.get(order.id)
+            entitlement_data = entitlements_mapping.get(order_item_id, {}) if order_item_id else {}
+
+            # Determine type dynamically from order metadata flow key
+            purchase_type = "gym_membership"
+            if order.order_metadata and isinstance(order.order_metadata, dict):
+                flow = order.order_metadata.get("order_info", {}).get("flow", "")
+                if flow == "personal_training_with_bonus_credits":
+                    purchase_type = "personal_training"
+
+            memberships.append({
+                "id": order.id,
+                "client_name": client_name,
+                "gym_name": gym_name,
+                "type": purchase_type,
+                "amount": float(order.gross_amount_minor / 100) if order.gross_amount_minor else 0.0,
+                "purchased_at": order.created_at,
+                "gym_contact": gym_contact,
+                "owner_contact": None, # Defer resolving owner details to paginated items only
+                "owner_name": "N/A",
+                "gym_owner_id": gym.owner_id, # Cache owner_id for batch fetching
+                "gym_area": gym_area,
+                "gym_city": gym_city,
+                "client_contact": client_contact,
+                "platform": client.platform,
+                "status": entitlement_data.get("status"),
+                "joined_at": entitlement_data.get("joined_at"),
+                "expire_at": entitlement_data.get("expire_at")
+            })
+
+        # Apply search filter across the FULL set of memberships
+        if search and search.strip():
+            search_term_lower = search.lower().strip()
+            memberships = [
+                m for m in memberships
+                if (m.get("client_name") and search_term_lower in m["client_name"].lower()) or
+                   (m.get("client_contact") and search_term_lower in str(m["client_contact"])) or
+                   (m.get("gym_name") and search_term_lower in m["gym_name"].lower())
+            ]
+
+        # Calculate distinct clients and gyms across ALL booking types
+        # Using same logic as all-purchases endpoint
+
+        # Step 1: Get counts from Sessions/Daily Pass
+        # Build DailyPass and SessionPurchase queries
+        daily_pass_query = (
+            select(
+                DailyPass.id.label("id"),
+                DailyPass.client_id.label("client_id"),
+                DailyPass.gym_id.label("gym_id"),
+                literal("Daily Pass").label("type"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name")
+            )
+            .select_from(DailyPass)
+            .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+            .outerjoin(Client, cast(DailyPass.client_id, Integer) == Client.client_id)
+            .where(DailyPass.gym_id != "1")
+        )
+
+        session_purchase_query = (
+            select(
+                SessionPurchase.id.label("id"),
+                SessionPurchase.client_id.label("client_id"),
+                SessionPurchase.gym_id.label("gym_id"),
+                literal("Session").label("type"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name")
+            )
+            .select_from(SessionPurchase)
+            .join(Gym, SessionPurchase.gym_id == Gym.gym_id)
+            .outerjoin(Client, SessionPurchase.client_id == Client.client_id)
+            .where(SessionPurchase.status == "paid")
+            .where(SessionPurchase.gym_id != 1)
+        )
+
+        # Combine queries
+        session_combined = union_all(daily_pass_query, session_purchase_query).alias("session_combined")
+
+        # Count clients from sessions/daily passes
+        session_client_counts = (
+            select(
+                session_combined.c.client_name,
+                func.count().label("booking_count")
+            )
+            .select_from(session_combined)
+            .where(session_combined.c.client_name.isnot(None))
+            .group_by(session_combined.c.client_name)
+        )
+        session_client_result = await db.execute(session_client_counts)
+        session_client_counts_map = {row.client_name: row.booking_count for row in session_client_result.all()}
+
+        # Count gyms from sessions/daily passes
+        session_gym_counts = (
+            select(
+                session_combined.c.gym_name,
+                func.count().label("booking_count")
+            )
+            .select_from(session_combined)
+            .where(session_combined.c.gym_name.isnot(None))
+            .group_by(session_combined.c.gym_name)
+        )
+        session_gym_result = await db.execute(session_gym_counts)
+        session_gym_counts_map = {row.gym_name: row.booking_count for row in session_gym_result.all()}
+
+        # Step 2: Get counts from Gym Memberships (using valid_orders collected earlier)
+        gm_valid_client_ids = []
+        gm_valid_gym_ids = []
+        for item in valid_orders:
+            client_id = item["order"].customer_id
+            gym_id = item["gym_id"]
+            if client_id:
+                try:
+                    gm_valid_client_ids.append(int(client_id))
+                except:
+                    pass
+            if gym_id and gym_id.isdigit():
+                gm_valid_gym_ids.append(int(gym_id))
+
+        # Count gym memberships per client
+        gm_client_counts_map = {}
+        if gm_valid_client_ids:
+            gm_client_query = (
+                select(
+                    Client.name,
+                    func.count().label("gm_count")
+                )
+                .where(Client.client_id.in_(gm_valid_client_ids))
+                .where(Client.name.isnot(None))
+                .group_by(Client.name)
+            )
+            gm_client_result = await db.execute(gm_client_query)
+            gm_client_counts_map = {row.name: row.gm_count for row in gm_client_result.all()}
+
+        # Count gym memberships per gym
+        gm_gym_counts_map = {}
+        if gm_valid_gym_ids:
+            gm_gym_query = (
+                select(
+                    Gym.name,
+                    func.count().label("gm_count")
+                )
+                .where(Gym.gym_id.in_(gm_valid_gym_ids))
+                .where(Gym.name.isnot(None))
+                .group_by(Gym.name)
+            )
+            gm_gym_result = await db.execute(gm_gym_query)
+            gm_gym_counts_map = {row.name: row.gm_count for row in gm_gym_result.all()}
+
+        # Step 3: Merge counts from all three types
+        final_distinct_clients = []
+        all_client_names = set(session_client_counts_map.keys()) | set(gm_client_counts_map.keys())
+        for client_name in all_client_names:
+            total_count = (
+                session_client_counts_map.get(client_name, 0) +
+                gm_client_counts_map.get(client_name, 0)
+            )
+            if total_count == 1:
+                final_distinct_clients.append(client_name)
+
+        final_distinct_gyms = []
+        all_gym_names = set(session_gym_counts_map.keys()) | set(gm_gym_counts_map.keys())
+        for gym_name in all_gym_names:
+            total_count = (
+                session_gym_counts_map.get(gym_name, 0) +
+                gm_gym_counts_map.get(gym_name, 0)
+            )
+            if total_count == 1:
+                final_distinct_gyms.append(gym_name)
+
+        # Apply distinct filters across the FULL set of memberships
+        if distinct_clients or distinct_gyms:
+            memberships = [
+                m for m in memberships
+                if (not distinct_clients or (m.get("client_name") and m["client_name"] in final_distinct_clients)) and
+                   (not distinct_gyms or (m.get("gym_name") and m["gym_name"] in final_distinct_gyms))
+            ]
+
+        # Update total after all filters (search + distinct) are applied
+        total = len(memberships)
+        total_pages = (total + limit - 1) // limit if total > 0 else 0
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        # Now paginate the fully filtered and distinct-checked memberships list
+        start_idx = (page - 1) * limit
+        end_idx = start_idx + limit
+        memberships = memberships[start_idx:end_idx]
+
+        # batch query gym owner details for ONLY the final paginated memberships (fixes N+1 loop)
+        owner_ids = [m.get("gym_owner_id") for m in memberships if m.get("gym_owner_id")]
+        owners_map = {}
+        if owner_ids:
+            owner_stmt = select(GymOwner).where(GymOwner.owner_id.in_(owner_ids))
+            owner_result = await db.execute(owner_stmt)
+            owners = owner_result.scalars().all()
+            owners_map = {o.owner_id: o for o in owners}
+
+        # Add gym owner details to the paginated list
+        for m in memberships:
+            owner_id = m.pop("gym_owner_id", None)
+            owner = owners_map.get(owner_id) if owner_id else None
+            m["owner_name"] = owner.name if owner else "N/A"
+            m["owner_contact"] = owner.contact_number if owner else None
+
+        return {
+            "success": True,
+            "data": {
+                "memberships": memberships,
+                "pagination": {
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": total_pages,
+                    "hasNext": has_next,
+                    "hasPrev": has_prev
+                },
+                "distinctClients": final_distinct_clients,
+                "distinctGyms": final_distinct_gyms
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in get_gym_memberships: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while fetching gym memberships"
+        )
+
+
+@router.get("/export-purchases")
+async def export_purchases(
+    search: Optional[str] = Query(None, description="Search by client or gym name"),
+    type: Optional[str] = Query(None, description="Filter by type: 'Session' or 'Daily Pass'"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    distinct_clients: Optional[bool] = Query(False, description="Show only distinct clients (1 booking across all types)"),
+    distinct_gyms: Optional[bool] = Query(False, description="Show only distinct gyms (1 booking across all types)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export all purchases to CSV file.
+    Returns all purchases (without pagination) for export purposes.
+    """
+    try:
+        search_pattern = f"%{search}%" if search else None
+
+        # Parse dates if provided
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        # Build DailyPass subquery with type label
+        daily_pass_query = (
+            select(
+                DailyPass.id.label("id"),
+                DailyPass.client_id.label("client_id"),
+                DailyPass.gym_id.label("gym_id"),
+                literal("Daily Pass").label("type"),
+                DailyPass.days_total.label("days_total"),
+                literal(None).label("total_sessions"),
+                literal(None).label("scheduled_sessions"),
+                (Payment.amount_minor / 100.0).label("amount"),
+                DailyPass.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Gym.contact_number.label("gym_contact"),
+                GymOwner.contact_number.label("owner_contact")
+            )
+            .select_from(DailyPass)
+            .outerjoin(Client, cast(DailyPass.client_id, Integer) == Client.client_id)
+            .outerjoin(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+            .outerjoin(GymOwner, Gym.owner_id == GymOwner.owner_id)
+            .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+        )
+
+        # Build SessionPurchase subquery with type label (only paid status)
+        session_purchase_query = (
+            select(
+                SessionPurchase.id.label("id"),
+                SessionPurchase.client_id.label("client_id"),
+                SessionPurchase.gym_id.label("gym_id"),
+                literal("Session").label("type"),
+                literal(None).label("days_total"),
+                SessionPurchase.sessions_count.label("total_sessions"),
+                SessionPurchase.scheduled_sessions.label("scheduled_sessions"),
+                SessionPurchase.payable_rupees.label("amount"),
+                SessionPurchase.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Gym.contact_number.label("gym_contact"),
+                GymOwner.contact_number.label("owner_contact")
+            )
+            .select_from(SessionPurchase)
+            .outerjoin(Client, SessionPurchase.client_id == Client.client_id)
+            .outerjoin(Gym, SessionPurchase.gym_id == Gym.gym_id)
+            .outerjoin(GymOwner, Gym.owner_id == GymOwner.owner_id)
+            .where(SessionPurchase.status == "paid")
+        )
+
+        # Apply search filters to both subqueries if search is provided
+        if search:
+            daily_pass_query = daily_pass_query.where(
+                or_(
+                    Client.name.ilike(search_pattern),
+                    Client.contact.ilike(search_pattern),
+                    Gym.name.ilike(search_pattern)
+                )
+            )
+            session_purchase_query = session_purchase_query.where(
+                or_(
+                    Client.name.ilike(search_pattern),
+                    Client.contact.ilike(search_pattern),
+                    Gym.name.ilike(search_pattern)
+                )
+            )
+
+        # Apply date filters to both subqueries if provided
+        if start_date_obj:
+            daily_pass_query = daily_pass_query.where(func.date(DailyPass.created_at) >= start_date_obj)
+            session_purchase_query = session_purchase_query.where(func.date(SessionPurchase.created_at) >= start_date_obj)
+        if end_date_obj:
+            daily_pass_query = daily_pass_query.where(func.date(DailyPass.created_at) <= end_date_obj)
+            session_purchase_query = session_purchase_query.where(func.date(SessionPurchase.created_at) <= end_date_obj)
+
+        # Combine both queries with UNION ALL
+        combined_query = union_all(daily_pass_query, session_purchase_query).alias("combined_purchases")
+
+        # Build distinct filtering subqueries (if distinct filter is requested)
+        distinct_client_filter = None
+        distinct_gym_filter = None
+
+        if distinct_clients or distinct_gyms:
+            # Get gym memberships base data for distinct calculation
+            gym_membership_data_query = (
+                select(
+                    Order.customer_id.label("client_id"),
+                    OrderItem.gym_id.label("gym_id"),
+                    Order.order_metadata.label("order_metadata")
+                )
+                .select_from(Payment)
+                .join(Order, Order.id == Payment.order_id)
+                .join(OrderItem, OrderItem.order_id == Order.id)
+                .where(Payment.status == "captured")
+                .where(Order.status == "paid")
+                .where(OrderItem.gym_id.isnot(None))
+                .where(OrderItem.gym_id != "1")
+            )
+
+            # Apply date filters to gym memberships
+            if start_date_obj:
+                gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) >= start_date_obj)
+            if end_date_obj:
+                gym_membership_data_query = gym_membership_data_query.where(func.date(Payment.created_at) <= end_date_obj)
+
+            gm_result = await db.execute(gym_membership_data_query)
+            gm_rows = gm_result.all()
+
+            # Filter by metadata conditions
+            valid_client_ids = []
+            valid_gym_ids = []
+            for row in gm_rows:
+                metadata = row.order_metadata
+                if not metadata or not isinstance(metadata, dict):
+                    continue
+
+                condition1 = (
+                    metadata.get("audit") and isinstance(metadata.get("audit"), dict) and
+                    metadata["audit"].get("source") == "dailypass_checkout_api"
+                )
+                condition2 = (
+                    metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                    metadata["order_info"].get("flow") == "unified_gym_membership_with_sub"
+                )
+                condition3 = (
+                    metadata.get("order_info") and isinstance(metadata.get("order_info"), dict) and
+                    metadata["order_info"].get("flow") == "unified_gym_membership_with_free_fittbot"
+                )
+
+                if condition1 or condition2 or condition3:
+                    if row.client_id:
+                        try:
+                            valid_client_ids.append(int(row.client_id))
+                        except:
+                            pass
+                    if row.gym_id and row.gym_id.isdigit():
+                        valid_gym_ids.append(int(row.gym_id))
+
+            # Build distinct client filter (clients with exactly 1 booking total)
+            if distinct_clients:
+                # Count bookings per client from sessions/daily passes
+                session_client_counts = (
+                    select(
+                        combined_query.c.client_name,
+                        func.count().label("booking_count")
+                    )
+                    .select_from(combined_query)
+                    .where(combined_query.c.client_name.isnot(None))
+                    .group_by(combined_query.c.client_name)
+                )
+                if type:
+                    session_client_counts = session_client_counts.where(combined_query.c.type == type)
+                session_client_result = await db.execute(session_client_counts)
+                session_client_counts_map = {row.client_name: row.booking_count for row in session_client_result.all()}
+
+                # Count gym memberships per client
+                gm_client_counts_map = {}
+                if valid_client_ids:
+                    gm_client_query = (
+                        select(Client.name, func.count().label("gm_count"))
+                        .where(Client.client_id.in_(valid_client_ids))
+                        .where(Client.name.isnot(None))
+                        .group_by(Client.name)
+                    )
+                    gm_client_result = await db.execute(gm_client_query)
+                    gm_client_counts_map = {row.name: row.gm_count for row in gm_client_result.all()}
+
+                # Find distinct clients (total count == 1)
+                distinct_client_names = set()
+                for client_name in set(session_client_counts_map.keys()) | set(gm_client_counts_map.keys()):
+                    total = session_client_counts_map.get(client_name, 0) + gm_client_counts_map.get(client_name, 0)
+                    if total == 1:
+                        distinct_client_names.add(client_name)
+
+                if distinct_client_names:
+                    distinct_client_filter = distinct_client_names
+
+            # Build distinct gym filter (gyms with exactly 1 booking total)
+            if distinct_gyms:
+                # Count bookings per gym from sessions/daily passes
+                session_gym_counts = (
+                    select(
+                        combined_query.c.gym_name,
+                        func.count().label("booking_count")
+                    )
+                    .select_from(combined_query)
+                    .where(combined_query.c.gym_name.isnot(None))
+                    .group_by(combined_query.c.gym_name)
+                )
+                if type:
+                    session_gym_counts = session_gym_counts.where(combined_query.c.type == type)
+                session_gym_result = await db.execute(session_gym_counts)
+                session_gym_counts_map = {row.gym_name: row.booking_count for row in session_gym_result.all()}
+
+                # Count gym memberships per gym
+                gm_gym_counts_map = {}
+                if valid_gym_ids:
+                    gm_gym_query = (
+                        select(Gym.name, func.count().label("gm_count"))
+                        .where(Gym.gym_id.in_(valid_gym_ids))
+                        .where(Gym.name.isnot(None))
+                        .group_by(Gym.name)
+                    )
+                    gm_gym_result = await db.execute(gm_gym_query)
+                    gm_gym_counts_map = {row.name: row.gm_count for row in gm_gym_result.all()}
+
+                # Find distinct gyms (total count == 1)
+                distinct_gym_names = set()
+                for gym_name in set(session_gym_counts_map.keys()) | set(gm_gym_counts_map.keys()):
+                    total = session_gym_counts_map.get(gym_name, 0) + gm_gym_counts_map.get(gym_name, 0)
+                    if total == 1:
+                        distinct_gym_names.add(gym_name)
+
+                if distinct_gym_names:
+                    distinct_gym_filter = distinct_gym_names
+
+        # Build the final query from the union result (no pagination for export)
+        final_query = (
+            select(
+                combined_query.c.id,
+                combined_query.c.client_id,
+                combined_query.c.gym_id,
+                combined_query.c.type,
+                combined_query.c.days_total,
+                combined_query.c.total_sessions,
+                combined_query.c.scheduled_sessions,
+                combined_query.c.amount,
+                combined_query.c.purchased_at,
+                combined_query.c.client_name,
+                combined_query.c.gym_name,
+                combined_query.c.gym_contact,
+                combined_query.c.owner_contact
+            )
+            .select_from(combined_query)
+            .order_by(combined_query.c.purchased_at.desc())
+        )
+
+        # Apply type filter if provided
+        if type:
+            final_query = final_query.where(combined_query.c.type == type)
+
+        # Apply distinct client filter
+        if distinct_client_filter:
+            final_query = final_query.where(combined_query.c.client_name.in_(distinct_client_filter))
+
+        # Apply distinct gym filter
+        if distinct_gym_filter:
+            final_query = final_query.where(combined_query.c.gym_name.in_(distinct_gym_filter))
+
+        # Execute query
+        result = await db.execute(final_query)
+        rows = result.all()
+
+        # Process scheduled_sessions to get display format
+        def get_session_display(scheduled_sessions_json):
+            """Process scheduled_sessions JSON to get 'X / Y sessions' format."""
+            if not scheduled_sessions_json:
+                return "N/A"
+            try:
+                if isinstance(scheduled_sessions_json, str):
+                    sessions = json.loads(scheduled_sessions_json)
+                elif isinstance(scheduled_sessions_json, list):
+                    sessions = scheduled_sessions_json
+                else:
+                    return "N/A"
+
+                if not sessions:
+                    return "N/A"
+
+                total_sessions = len(sessions)
+                unique_dates = len(set(s.get("date") for s in sessions if s.get("date")))
+                return f"{unique_dates} / {total_sessions} sessions"
+            except Exception:
+                return "N/A"
+
+        # Format purchase date
+        def format_date(date_obj):
+            if date_obj:
+                return date_obj.strftime("%d-%b-%Y")
+            return "N/A"
+
+        # Format amount
+        def format_amount(amount):
+            return f"₹{float(amount):.2f}" if amount else "₹0.00"
+
+        # Create Excel workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Purchases"
+
+        # Write header
+        headers = ["Client Name", "Gym Name", "Type", "Days / Sessions", "Amount", "Purchased At"]
+        ws.append(headers)
+
+        # Style the header row
+        header_fill = PatternFill(start_color="FF5757", end_color="FF5757", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Write data rows
+        for row in rows:
+            if row.type == "Daily Pass":
+                days_sessions = str(row.days_total) if row.days_total else "N/A"
+            else:  # Session
+                days_sessions = get_session_display(row.scheduled_sessions)
+
+            ws.append([
+                row.client_name or "N/A",
+                row.gym_name or "N/A",
+                row.type,
+                days_sessions,
+                format_amount(row.amount),
+                format_date(row.purchased_at)
+            ])
+
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"purchases_export_{timestamp}.xlsx"
+
+        # Return Excel file as streaming response
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in export_purchases: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while exporting purchases"
+        )
+
+
+@router.get("/export-today-schedule")
+async def export_today_schedule(
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export today's schedule to Excel file.
+    Returns all daily pass days and session bookings scheduled for today (without pagination).
+    """
+    try:
+        today = date.today()
+
+        # Build DailyPassDay subquery with type label
+        daily_pass_query = (
+            select(
+                DailyPassDay.id,
+                DailyPassDay.scheduled_date.label("booking_date"),
+                DailyPassDay.status.label("day_status"),
+                DailyPassDay.checkin_at.label("checkin_at"),
+                DailyPass.days_total,
+                (Payment.amount_minor / 100.0).label("amount"),
+                DailyPass.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Client.platform.label("platform"),
+                literal("Daily Pass").label("type"),
+                literal(None).label("session_name"),
+            )
+            .select_from(DailyPassDay)
+            .join(DailyPass, DailyPassDay.pass_id == DailyPass.id)
+            .outerjoin(Client, cast(DailyPassDay.client_id, Integer) == Client.client_id)
+            .outerjoin(Gym, cast(DailyPassDay.gym_id, Integer) == Gym.gym_id)
+            .outerjoin(Payment, DailyPass.payment_id == Payment.provider_payment_id)
+            .where(DailyPassDay.scheduled_date == today)
+            .where(DailyPassDay.gym_id != 1)  # Exclude gym_id = 1
+        )
+
+        # Build SessionBookingDay subquery with type label
+        session_booking_query = (
+            select(
+                SessionBookingDay.id,
+                SessionBookingDay.booking_date,
+                SessionBookingDay.status.label("day_status"),
+                SessionBookingDay.scanned_at.label("checkin_at"),
+                literal(None).label("days_total"),
+                SessionPurchase.payable_rupees.label("amount"),
+                SessionPurchase.created_at.label("purchased_at"),
+                Client.name.label("client_name"),
+                Gym.name.label("gym_name"),
+                Client.platform.label("platform"),
+                literal("Session").label("type"),
+                ClassSession.name.label("session_name")
+            )
+            .select_from(SessionBookingDay)
+            .join(SessionPurchase, SessionBookingDay.purchase_id == SessionPurchase.id)
+            .join(ClassSession, SessionPurchase.session_id == ClassSession.id)
+            .outerjoin(Client, SessionBookingDay.client_id == Client.client_id)
+            .outerjoin(Gym, SessionBookingDay.gym_id == Gym.gym_id)
+            .where(SessionBookingDay.booking_date == today)
+            .where(SessionBookingDay.gym_id != 1)  # Exclude gym_id = 1
+        )
+
+        # Combine both queries with UNION ALL
+        combined_query = union_all(daily_pass_query, session_booking_query).alias("combined_schedule")
+
+        # Build the final query from the union result (no pagination for export)
+        final_query = (
+            select(
+                combined_query.c.id,
+                combined_query.c.booking_date,
+                combined_query.c.day_status,
+                combined_query.c.checkin_at,
+                combined_query.c.days_total,
+                combined_query.c.amount,
+                combined_query.c.purchased_at,
+                combined_query.c.client_name,
+                combined_query.c.gym_name,
+                combined_query.c.type
+            )
+            .select_from(combined_query)
+            .order_by(combined_query.c.booking_date.desc(), combined_query.c.purchased_at.desc())
+        )
+
+        # Execute query
+        result = await db.execute(final_query)
+        rows = result.all()
+
+        # Format functions
+        def format_date(date_obj):
+            if date_obj:
+                return date_obj.strftime("%d-%b-%Y")
+            return "N/A"
+
+        def format_datetime(date_obj):
+            if date_obj:
+                return date_obj.strftime("%d-%b-%Y %H:%M")
+            return "N/A"
+
+        def format_amount(amount):
+            return f"₹{float(amount):.2f}" if amount else "₹0.00"
+
+        # Create Excel workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Today's Schedule"
+
+        # Write header
+        headers = ["Client Name", "Gym Name", "Type", "Scheduled Date", "Status", "Check-in At", "Amount", "Purchased At", "Platform"]
+        ws.append(headers)
+
+        # Style the header row
+        header_fill = PatternFill(start_color="FF5757", end_color="FF5757", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Write data rows
+        for row in rows:
+            ws.append([
+                row.client_name or "N/A",
+                row.gym_name or "N/A",
+                row.type,
+                format_date(row.booking_date),
+                row.day_status or "N/A",
+                format_datetime(row.checkin_at),
+                format_amount(row.amount),
+                format_datetime(row.purchased_at),
+                (row.platform or "N/A").capitalize() if row.platform else "N/A"
+            ])
+
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"today_schedule_{timestamp}.xlsx"
+
+        # Return Excel file as streaming response
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in export_today_schedule: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while exporting today's schedule"
+        )
+
+
+@router.get("/export-gym-memberships")
+async def export_gym_memberships(
+    search: Optional[str] = Query(None, description="Search by client or gym name"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    distinct_clients: Optional[bool] = Query(False, description="Show only distinct clients (1 booking across all types)"),
+    distinct_gyms: Optional[bool] = Query(False, description="Show only distinct gyms (1 booking across all types)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export all gym memberships to Excel file.
+    Using same logic as Financials/Revenue Analytics APIs (Order-based approach).
+    Returns all memberships (without pagination) for export purposes.
+    Excludes gym_id = 1, rows where client_id is not in clients table,
+    and rows where gym_id is not in gyms table.
+    Supports filtering by search, date range, and distinct clients/gyms.
+    """
+    try:
+        # Fetch all gym memberships using Order-based approach (same as Financials API)
+        gym_membership_stmt = (
+            select(Payment, Order)
+            .join(Order, Order.id == Payment.order_id)
+            .where(Payment.status == "captured")
+            .where(Order.status == "paid")
+        )
+
+        # Apply date filter
+        if start_date:
+            try:
+                start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+                gym_membership_stmt = gym_membership_stmt.where(Order.created_at >= start_datetime)
+            except ValueError:
+                pass
+
+        if end_date:
+            try:
+                end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+                # Include the entire end date
+                end_datetime = end_datetime + timedelta(days=1)
+                gym_membership_stmt = gym_membership_stmt.where(Order.created_at < end_datetime)
+            except ValueError:
+                pass
+
+        gym_membership_result = await db.execute(gym_membership_stmt)
+        all_payments = gym_membership_result.all()
+
+        # Collect order IDs to fetch gym info from order_items (exclude gym_id = 1)
+        order_ids = [row.Order.id for row in all_payments]
+
+        # Fetch order items to get gym_ids (exclude gym_id = 1)
+        order_gym_mapping = {}
+        order_gym_id_mapping = {}  # Store actual gym_id values
+        if order_ids:
+            order_items_stmt = (
+                select(OrderItem)
+                .where(OrderItem.order_id.in_(order_ids))
+                .where(OrderItem.gym_id.isnot(None))
+                .where(OrderItem.gym_id != "1")
+            )
+            order_items_result = await db.execute(order_items_stmt)
+            order_items = order_items_result.scalars().all()
+
+            # Create mapping from order_id to gym_id
+            for item in order_items:
+                if item.gym_id and item.gym_id.strip() and item.gym_id.isdigit():
+                    order_gym_mapping[item.order_id] = int(item.gym_id)
+                    order_gym_id_mapping[item.order_id] = item.gym_id
+
+        # Filter by metadata conditions and collect valid orders
+        valid_orders = []
+        for row in all_payments:
+            payment = row.Payment
+            order = row.Order
+
+            # Check order_metadata for specific conditions (same as Financials/Revenue Analytics)
+            if not order.order_metadata or not isinstance(order.order_metadata, dict):
+                continue
+
+            metadata = order.order_metadata
+
+            # Condition 1: audit.source = "dailypass_checkout_api"
+            condition1 = False
+            if metadata.get("audit") and isinstance(metadata.get("audit"), dict):
+                if metadata["audit"].get("source") == "dailypass_checkout_api":
+                    condition1 = True
+
+            # Condition 2: order_info.flow = "unified_gym_membership_with_sub"
+            condition2 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "unified_gym_membership_with_sub":
+                    condition2 = True
+
+            # Condition 3: order_info.flow = "unified_gym_membership_with_free_fittbot"
+            condition3 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "unified_gym_membership_with_free_fittbot":
+                    condition3 = True
+
+            # Condition 4: order_info.flow = "gym_membership_with_bonus_credits"
+            condition4 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "gym_membership_with_bonus_credits":
+                    condition4 = True
+
+            # Condition 5: order_info.flow = "personal_training_with_bonus_credits"
+            condition5 = False
+            if metadata.get("order_info") and isinstance(metadata.get("order_info"), dict):
+                if metadata["order_info"].get("flow") == "personal_training_with_bonus_credits":
+                    condition5 = True
+
+            # Only include if any condition matches AND order has valid gym_id (not gym_id = 1)
+            if not (condition1 or condition2 or condition3 or condition4 or condition5):
+                continue
+
+            if order.id not in order_gym_mapping:
+                continue
+
+            valid_orders.append({
+                "order": order,
+                "gym_id": order_gym_id_mapping[order.id]
+            })
+
+        # Sort by purchased_at descending
+        valid_orders.sort(key=lambda x: x["order"].created_at, reverse=True)
+
+        # Format functions
+        def format_date(date_obj):
+            if date_obj:
+                return date_obj.strftime("%d-%b-%Y")
+            return "N/A"
+
+        def format_amount(amount):
+            return f"₹{float(amount):.2f}" if amount else "₹0.00"
+
+        # Create Excel workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Gym Memberships"
+
+        # Write header
+        headers = ["Client Name", "Gym Name", "Type", "Amount", "Purchased At", "Platform"]
+        ws.append(headers)
+
+        # Style the header row
+        header_fill = PatternFill(start_color="FF5757", end_color="FF5757", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Calculate distinct clients and gyms if filters are enabled
+        distinct_clients_set = set()
+        distinct_gyms_set = set()
+
+        if distinct_clients or distinct_gyms:
+            # Count sessions (fitness classes) by client/gym
+            session_client_counts = {}
+            session_gym_counts = {}
+
+            session_orders_stmt = (
+                select(Order)
+                .join(Payment, Payment.order_id == Order.id)
+                .where(Payment.status == "captured")
+                .where(Order.status == "paid")
+                .where(Order.type == "Session")
+            )
+
+            session_result = await db.execute(session_orders_stmt)
+            session_orders = session_result.scalars().all()
+
+            for order in session_orders:
+                if order.customer_id:
+                    session_client_counts[str(order.customer_id)] = session_client_counts.get(str(order.customer_id), 0) + 1
+                if order.gym_id:
+                    session_gym_counts[str(order.gym_id)] = session_gym_counts.get(str(order.gym_id), 0) + 1
+
+            # Count daily passes by client/gym
+            daily_pass_client_counts = {}
+            daily_pass_gym_counts = {}
+
+            daily_pass_orders_stmt = (
+                select(Order)
+                .join(Payment, Payment.order_id == Order.id)
+                .where(Payment.status == "captured")
+                .where(Order.status == "paid")
+                .where(Order.type == "Daily Pass")
+            )
+
+            daily_pass_result = await db.execute(daily_pass_orders_stmt)
+            daily_pass_orders = daily_pass_result.scalars().all()
+
+            for order in daily_pass_orders:
+                if order.customer_id:
+                    daily_pass_client_counts[str(order.customer_id)] = daily_pass_client_counts.get(str(order.customer_id), 0) + 1
+                if order.gym_id:
+                    daily_pass_gym_counts[str(order.gym_id)] = daily_pass_gym_counts.get(str(order.gym_id), 0) + 1
+
+            # Collect gym membership clients/gyms from valid_orders
+            gym_membership_client_ids = set()
+            gym_membership_gym_ids = set()
+
+            for item in valid_orders:
+                if item["order"].customer_id:
+                    gym_membership_client_ids.add(str(item["order"].customer_id))
+                if item["gym_id"]:
+                    gym_membership_gym_ids.add(item["gym_id"])
+
+            # Calculate total bookings and identify distinct clients
+            all_client_ids = set(session_client_counts.keys()) | set(daily_pass_client_counts.keys()) | gym_membership_client_ids
+
+            for client_id in all_client_ids:
+                session_count = session_client_counts.get(client_id, 0)
+                daily_pass_count = daily_pass_client_counts.get(client_id, 0)
+                gym_membership_count = 1 if client_id in gym_membership_client_ids else 0
+                total = session_count + daily_pass_count + gym_membership_count
+
+                if total == 1:
+                    distinct_clients_set.add(client_id)
+
+            # Calculate total bookings and identify distinct gyms
+            all_gym_ids = set(session_gym_counts.keys()) | set(daily_pass_gym_counts.keys()) | gym_membership_gym_ids
+
+            for gym_id in all_gym_ids:
+                session_count = session_gym_counts.get(gym_id, 0)
+                daily_pass_count = daily_pass_gym_counts.get(gym_id, 0)
+                gym_membership_count = 1 if gym_id in gym_membership_gym_ids else 0
+                total = session_count + daily_pass_count + gym_membership_count
+
+                if total == 1:
+                    distinct_gyms_set.add(gym_id)
+
+        # Write data rows
+        for item in valid_orders:
+            order = item["order"]
+            gym_id_str = item["gym_id"]
+
+            # Fetch client details
+            # Skip row if client not found in clients table
+            if not order.customer_id:
+                continue
+
+            try:
+                client_stmt = select(Client).where(Client.client_id == int(order.customer_id))
+                client_result = await db.execute(client_stmt)
+                client = client_result.scalar_one_or_none()
+                if not client:
+                    # Skip this row if client not found in clients table
+                    continue
+                client_name = client.name or "N/A"
+                client_platform = client.platform or "N/A"
+            except:
+                continue
+
+            # Fetch gym details
+            # Skip row if gym not found in gyms table
+            if not gym_id_str or not gym_id_str.isdigit():
+                continue
+
+            try:
+                gym_stmt = select(Gym).where(Gym.gym_id == int(gym_id_str))
+                gym_result = await db.execute(gym_stmt)
+                gym = gym_result.scalar_one_or_none()
+                if not gym:
+                    # Skip this row if gym not found in gyms table
+                    continue
+                gym_name = gym.name or "N/A"
+            except:
+                continue
+
+            # Apply search filter
+            if search:
+                search_lower = search.lower()
+                if search_lower not in (client_name or "").lower() and search_lower not in (gym_name or "").lower():
+                    continue
+
+            # Apply distinct clients filter
+            if distinct_clients and order.customer_id:
+                if str(order.customer_id) not in distinct_clients_set:
+                    continue
+
+            # Apply distinct gyms filter
+            if distinct_gyms and gym_id_str:
+                if gym_id_str not in distinct_gyms_set:
+                    continue
+
+            # Determine type dynamically from order metadata flow key
+            purchase_type = "Gym Membership"
+            if order.order_metadata and isinstance(order.order_metadata, dict):
+                flow = order.order_metadata.get("order_info", {}).get("flow", "")
+                if flow == "personal_training_with_bonus_credits":
+                    purchase_type = "Personal Training"
+
+            ws.append([
+                client_name,
+                gym_name,
+                purchase_type,
+                format_amount((order.gross_amount_minor / 100) if order.gross_amount_minor else 0),
+                format_date(order.created_at),
+                client_platform
+            ])
+
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"gym_memberships_{timestamp}.xlsx"
+
+        # Return Excel file as streaming response
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Error in export_gym_memberships: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while exporting gym memberships"
+        )
+
+
+@router.get("/nutritionist-plans")
+async def get_nutritionist_plans(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name, email, or mobile"),
+    sort_order: str = Query("desc", description="Sort order for purchase date"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    
+    try:
+        import math
+
+        # Contacts to always exclude (internal/test accounts)
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        from app.models.nutrition_models import NutritionEligibility, NutritionBooking
+        from sqlalchemy import String
+
+        # Subquery to get latest booking per eligibility source_id (payments.order_id)
+        booking_subquery = (
+            select(
+                NutritionEligibility.source_id.label("eligibility_source_id"),
+                NutritionBooking.booking_date.label("booking_date"),
+                NutritionBooking.status.label("booking_status"),
+                NutritionBooking.session_number.label("session_number"),
+                NutritionBooking.start_time.label("start_time"),
+                NutritionBooking.end_time.label("end_time"),
+                func.row_number().over(
+                    partition_by=NutritionEligibility.source_id,
+                    order_by=desc(NutritionBooking.booking_date)
+                ).label("row_num")
+            )
+            .select_from(NutritionEligibility)
+            .join(
+                NutritionBooking,
+                NutritionEligibility.id == NutritionBooking.eligibility_id
+            )
+            .subquery()
+        )
+
+        # Build base query for Payment table — always join Client to apply exclusion
+        base_payment_query = (
+            select(Payment.customer_id)
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .join(
+                NutritionEligibility,
+                cast(Payment.order_id, String) == NutritionEligibility.source_id
+            )
+            .where(NutritionEligibility.source_type == "fymble_purchase")
+            .where(Payment.status == "captured")
+            .where(or_(
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'nutrition_purchase_googleplay',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'nutrition_package_razorpay',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'basic_nutrition_plan',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'expert_nutrition_plan',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'elite_nutrition_plan'
+            ))
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))  # Exclude internal/test contacts
+        )
+
+        # Apply search filter to base query
+        if search:
+            search_term = f"%{search.lower()}%"
+            base_payment_query = base_payment_query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        # Get unique users count (matches home page logic)
+        unique_count_subquery = base_payment_query.subquery()
+        unique_count_stmt = select(func.count(distinct(unique_count_subquery.c.customer_id)))
+        unique_count_result = await db.execute(unique_count_stmt)
+        unique_users_count = unique_count_result.scalar() or 0
+
+        # Build main query with all columns and booking details
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Payment.payment_metadata.label("payment_metadata"),
+                Client.client_id.label("client_id"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+                Client.created_at.label("client_created_at"),
+                booking_subquery.c.booking_date.label("booked_date_value"),
+                booking_subquery.c.booking_status.label("booked_status_value"),
+                booking_subquery.c.session_number.label("session_number_value"),
+                booking_subquery.c.start_time.label("start_time_value"),
+                booking_subquery.c.end_time.label("end_time_value")
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .join(
+                NutritionEligibility,
+                cast(Payment.order_id, String) == NutritionEligibility.source_id
+            )
+            .outerjoin(
+                booking_subquery,
+                and_(
+                    cast(Payment.order_id, String) == booking_subquery.c.eligibility_source_id,
+                    booking_subquery.c.row_num == 1
+                )
+            )
+            .where(NutritionEligibility.source_type == "fymble_purchase")
+            .where(Payment.status == "captured")
+            .where(or_(
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'nutrition_purchase_googleplay',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'nutrition_package_razorpay',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'basic_nutrition_plan',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'expert_nutrition_plan',
+                func.json_extract(Payment.payment_metadata, '$.flow') == 'elite_nutrition_plan'
+            ))
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))  # Exclude internal/test contacts
+        )
+
+        # Apply search filter
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        # Get total count
+        count_subquery = query.subquery()
+        count_stmt = select(func.count()).select_from(count_subquery)
+        count_result = await db.execute(count_stmt)
+        total_count = count_result.scalar() or 0
+
+        if total_count == 0:
+            return {
+                "success": True,
+                "data": {
+                    "users": [],
+                    "total": 0,
+                    "unique_users": 0,
+                    "page": page,
+                    "limit": limit,
+                    "totalPages": 0,
+                    "hasNext": False,
+                    "hasPrev": False
+                },
+                "message": "Nutritionist plans fetched successfully"
+            }
+
+        # Apply sorting in SQL
+        if sort_order == "asc":
+            query = query.order_by(asc(Payment.captured_at))
+        else:
+            query = query.order_by(desc(Payment.captured_at))
+
+        # Apply pagination in SQL (backend pagination)
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
+
+        # Execute query (single query - no N+1)
+        result = await db.execute(query)
+        rows = result.all()
+
+        # Format response with required columns
+        nutritionist_plan_users = []
+        for row in rows:
+            # Format booked_date from the matched booking_subquery
+            booked_date = None
+            if row.booked_date_value:
+                try:
+                    booked_date = row.booked_date_value.strftime("%Y-%m-%d")
+                except:
+                    booked_date = str(row.booked_date_value)
+
+            # Format dates and amounts
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d") if row.purchased_at else "N/A"
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+
+            # Determine the session denominator based on the flow
+            flow = None
+            if row.payment_metadata and isinstance(row.payment_metadata, dict):
+                flow = row.payment_metadata.get("flow")
+
+            denominator = ""
+            if flow == "basic_nutrition_plan":
+                denominator = "/1"
+            elif flow == "expert_nutrition_plan":
+                denominator = "/4"
+            elif flow == "elite_nutrition_plan":
+                denominator = "/12"
+
+            session_count_val = row.session_number_value if row.session_number_value is not None else 0
+            session_count_str = f"{session_count_val}{denominator}"
+
+            # Format timing from start_time and end_time
+            timing = "N/A"
+            if row.start_time_value and row.end_time_value:
+                try:
+                    timing = f"{row.start_time_value.strftime('%I:%M %p')} - {row.end_time_value.strftime('%I:%M %p')}"
+                except:
+                    timing = "N/A"
+
+            user_data = {
+                "id": row.purchase_id,
+                "customer_id": row.customer_id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "mobile": row.client_contact or "N/A",
+                "purchased_date": purchased_date,
+                "booked_date": booked_date or "N/A",
+                "timing": timing,
+                "status": row.booked_status_value or "N/A",
+                "session_count": session_count_str,
+                "amount": amount_rupees
+            }
+            nutritionist_plan_users.append(user_data)
+
+        # Calculate pagination info
+        total_pages = math.ceil(total_count / limit)
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        return {
+            "success": True,
+            "data": {
+                "users": nutritionist_plan_users,
+                "total": total_count,
+                "unique_users": unique_users_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": total_pages,
+                "hasNext": has_next,
+                "hasPrev": has_prev
+            },
+            "message": "Nutritionist plans fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching nutritionist plans: {str(e)}"
+        )
+
+
+@router.get("/complimentary-plans")
+async def get_complimentary_plans(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search by client name, email, or mobile"),
+    sort_order: str = Query("desc", description="Sort order for granted date"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    try:
+        import math
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+        from app.models.nutrition_models import NutritionEligibility, NutritionBooking
+        
+        # Subquery to get latest booking per eligibility_id
+        booking_subquery = (
+            select(
+                NutritionBooking.eligibility_id.label("eligibility_id"),
+                NutritionBooking.booking_date.label("booking_date"),
+                NutritionBooking.status.label("booking_status"),
+                NutritionBooking.session_number.label("session_number"),
+                NutritionBooking.start_time.label("start_time"),
+                NutritionBooking.end_time.label("end_time"),
+                func.row_number().over(
+                    partition_by=NutritionBooking.eligibility_id,
+                    order_by=desc(NutritionBooking.booking_date)
+                ).label("row_num")
+            )
+            .select_from(NutritionBooking)
+            .subquery()
+        )
+
+        base_query = (
+            select(NutritionEligibility.client_id)
+            .select_from(NutritionEligibility)
+            .outerjoin(Client, NutritionEligibility.client_id == Client.client_id)
+            .where(NutritionEligibility.source_type != "fymble_purchase")
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            base_query = base_query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        unique_count_subquery = base_query.subquery()
+        unique_count_stmt = select(func.count(distinct(unique_count_subquery.c.client_id)))
+        unique_count_result = await db.execute(unique_count_stmt)
+        unique_users_count = unique_count_result.scalar() or 0
+
+        query = (
+            select(
+                NutritionEligibility.id.label("purchase_id"),
+                NutritionEligibility.client_id.label("customer_id"),
+                NutritionEligibility.client_id.label("client_id"),
+                NutritionEligibility.granted_at.label("purchased_at"),
+                NutritionEligibility.total_sessions.label("total_sessions"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+                Client.created_at.label("client_created_at"),
+                booking_subquery.c.booking_date.label("booked_date_value"),
+                booking_subquery.c.booking_status.label("booked_status_value"),
+                booking_subquery.c.session_number.label("session_number_value"),
+                booking_subquery.c.start_time.label("start_time_value"),
+                booking_subquery.c.end_time.label("end_time_value")
+            )
+            .select_from(NutritionEligibility)
+            .outerjoin(Client, NutritionEligibility.client_id == Client.client_id)
+            .outerjoin(
+                booking_subquery,
+                and_(
+                    NutritionEligibility.id == booking_subquery.c.eligibility_id,
+                    booking_subquery.c.row_num == 1
+                )
+            )
+            .where(NutritionEligibility.source_type != "fymble_purchase")
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        count_subquery = query.subquery()
+        count_stmt = select(func.count()).select_from(count_subquery)
+        count_result = await db.execute(count_stmt)
+        total_count = count_result.scalar() or 0
+
+        if total_count == 0:
+            return {
+                "success": True,
+                "data": {
+                    "users": [], "total": 0, "unique_users": 0,
+                    "page": page, "limit": limit, "totalPages": 0,
+                    "hasNext": False, "hasPrev": False
+                },
+                "message": "Complimentary plans fetched successfully"
+            }
+
+        if sort_order == "asc":
+            query = query.order_by(asc(NutritionEligibility.granted_at))
+        else:
+            query = query.order_by(desc(NutritionEligibility.granted_at))
+
+        offset = (page - 1) * limit
+        query = query.offset(offset).limit(limit)
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        nutritionist_plan_users = []
+        for row in rows:
+            booked_date = None
+            if row.booked_date_value:
+                try:
+                    booked_date = row.booked_date_value.strftime("%Y-%m-%d")
+                except:
+                    booked_date = str(row.booked_date_value)
+
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d") if row.purchased_at else "N/A"
+            amount_rupees = 0.0
+
+            session_count_val = row.session_number_value if row.session_number_value is not None else 0
+            total_sess = row.total_sessions if row.total_sessions else 1
+            session_count_str = f"{session_count_val}/{total_sess}"
+
+            timing = "N/A"
+            if row.start_time_value and row.end_time_value:
+                try:
+                    timing = f"{row.start_time_value.strftime('%I:%M %p')} - {row.end_time_value.strftime('%I:%M %p')}"
+                except:
+                    timing = "N/A"
+
+            user_data = {
+                "id": row.purchase_id,
+                "customer_id": row.customer_id,
+                "client_id": row.client_id,
+                "client_name": row.client_name or "N/A",
+                "mobile": row.client_contact or "N/A",
+                "purchased_date": purchased_date,
+                "booked_date": booked_date or "N/A",
+                "timing": timing,
+                "status": row.booked_status_value or "N/A",
+                "session_count": session_count_str,
+                "amount": amount_rupees,
+                "gym_name": "N/A"
+            }
+            nutritionist_plan_users.append(user_data)
+
+        total_pages = math.ceil(total_count / limit)
+        has_next = page < total_pages
+        has_prev = page > 1
+
+        return {
+            "success": True,
+            "data": {
+                "users": nutritionist_plan_users, "total": total_count, "unique_users": unique_users_count,
+                "page": page, "limit": limit, "totalPages": total_pages,
+                "hasNext": has_next, "hasPrev": has_prev
+            },
+            "message": "Complimentary plans fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching complimentary plans: {str(e)}")
+
+@router.get("/export-complimentary-plans")
+async def export_complimentary_plans(
+    db: AsyncSession = Depends(get_async_db)
+):
+    try:
+        from app.models.nutrition_models import NutritionEligibility, NutritionBooking
+        from app.models.fittbot_models import Client
+        import pandas as pd
+        from io import BytesIO
+        from fastapi.responses import StreamingResponse
+        from datetime import datetime
+        
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        booking_subquery = (
+            select(
+                NutritionBooking.eligibility_id.label("eligibility_id"),
+                NutritionBooking.booking_date.label("booking_date"),
+                NutritionBooking.status.label("booking_status"),
+                NutritionBooking.session_number.label("session_number"),
+                NutritionBooking.start_time.label("start_time"),
+                NutritionBooking.end_time.label("end_time"),
+                func.row_number().over(
+                    partition_by=NutritionBooking.eligibility_id,
+                    order_by=desc(NutritionBooking.booking_date)
+                ).label("row_num")
+            )
+            .select_from(NutritionBooking)
+            .subquery()
+        )
+
+        query = (
+            select(
+                NutritionEligibility.id.label("purchase_id"),
+                NutritionEligibility.client_id.label("customer_id"),
+                NutritionEligibility.granted_at.label("purchased_at"),
+                NutritionEligibility.total_sessions.label("total_sessions"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+                Client.created_at.label("client_created_at"),
+                booking_subquery.c.booking_date.label("booked_date_value"),
+                booking_subquery.c.booking_status.label("booked_status_value"),
+                booking_subquery.c.session_number.label("session_number_value"),
+                booking_subquery.c.start_time.label("start_time_value"),
+                booking_subquery.c.end_time.label("end_time_value")
+            )
+            .select_from(NutritionEligibility)
+            .outerjoin(Client, NutritionEligibility.client_id == Client.client_id)
+            .outerjoin(
+                booking_subquery,
+                and_(
+                    NutritionEligibility.id == booking_subquery.c.eligibility_id,
+                    booking_subquery.c.row_num == 1
+                )
+            )
+            .where(NutritionEligibility.source_type != "fymble_purchase")
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+            .order_by(desc(NutritionEligibility.granted_at))
+        )
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        export_data = []
+        for row in rows:
+            booked_date = "N/A"
+            if row.booked_date_value:
+                try:
+                    booked_date = row.booked_date_value.strftime("%Y-%m-%d")
+                except:
+                    booked_date = str(row.booked_date_value)
+
+            purchased_date = row.purchased_at.strftime("%Y-%m-%d %H:%M:%S") if row.purchased_at else "N/A"
+            client_joined = row.client_created_at.strftime("%Y-%m-%d") if row.client_created_at else "N/A"
+
+            timing = "N/A"
+            if row.start_time_value and row.end_time_value:
+                try:
+                    timing = f"{row.start_time_value.strftime('%I:%M %p')} - {row.end_time_value.strftime('%I:%M %p')}"
+                except:
+                    timing = "N/A"
+                    
+            session_count_val = row.session_number_value if row.session_number_value is not None else 0
+            total_sess = row.total_sessions if row.total_sessions else 1
+            session_count_str = f"{session_count_val}/{total_sess}"
+
+            export_data.append({
+                "Purchase ID": row.purchase_id,
+                "Client Name": row.client_name or "N/A",
+                "Contact": row.client_contact or "N/A",
+                "Client Joined Date": client_joined,
+                "Purchased At": purchased_date,
+                "Latest Booking Date": booked_date,
+                "Timing": timing,
+                "Session": session_count_str,
+                "Status": row.booked_status_value or "N/A"
+            })
+
+        df = pd.DataFrame(export_data)
+        
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Complimentary Plans", index=False)
+            
+            worksheet = writer.sheets["Complimentary Plans"]
+            for i, col in enumerate(df.columns):
+                column_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                worksheet.set_column(i, i, column_len)
+                
+        output.seek(0)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"complimentary_plans_{timestamp}.xlsx"
+        
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error exporting complimentary plans: {str(e)}")
+
+@router.get("/export-ai-credits")
+async def export_ai_credits(
+    search: Optional[str] = Query(None, description="Search by client name or mobile"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export AI Credits purchases to Excel.
+    Same filter as /ai-credits listing endpoint:
+      - payment_metadata['flow'] == 'food_scanner_credits' or 'food_scanner_credits_razorpay' (exact match)
+      - status == 'captured'
+      - Excludes internal/test contacts
+    """
+    try:
+        import logging
+
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        ai_flow_cond = or_(
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+            func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay"
+        )
+
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(Payment.status == "captured")
+            .where(ai_flow_cond)
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if start_date_obj:
+            query = query.where(func.date(Payment.captured_at) >= start_date_obj)
+        if end_date_obj:
+            query = query.where(func.date(Payment.captured_at) <= end_date_obj)
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        query = query.order_by(desc(Payment.captured_at))
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        # Build Excel
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "AI Credits"
+
+        headers = ["#", "Client Name", "Contact", "Purchased Date", "Amount (₹)"]
+        ws.append(headers)
+
+        # Header style — cyan to match AI credits theme
+        header_fill = PatternFill(start_color="0891B2", end_color="0891B2", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        def fmt_date(d):
+            if not d:
+                return "N/A"
+            return d.strftime("%Y-%m-%d")
+
+        for idx, row in enumerate(rows, start=1):
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+            ws.append([
+                idx,
+                row.client_name or "N/A",
+                row.client_contact or "N/A",
+                fmt_date(row.purchased_at),
+                f"{amount_rupees:.2f}",
+            ])
+
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            col_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"ai_credits_{timestamp}.xlsx"
+
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    except Exception as e:
+        import logging
+        logging.error(f"Error in export_ai_credits: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while exporting AI credits"
+        )
+
+
+@router.get("/export-ai-diet-coach")
+async def export_ai_diet_coach(
+    search: Optional[str] = Query(None, description="Search by client name or mobile"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Export AI Diet Coach purchases to Excel.
+    """
+    try:
+        import logging
+
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+        ai_flow_cond = (func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach")
+
+        query = (
+            select(
+                Payment.id.label("purchase_id"),
+                Payment.customer_id.label("customer_id"),
+                Payment.captured_at.label("purchased_at"),
+                Payment.amount_minor.label("amount_minor"),
+                Client.name.label("client_name"),
+                Client.contact.label("client_contact"),
+            )
+            .select_from(Payment)
+            .outerjoin(Client, Payment.customer_id == Client.client_id)
+            .where(Payment.status == "captured")
+            .where(ai_flow_cond)
+            .where(~Client.contact.in_(EXCLUDED_CONTACTS))
+        )
+
+        if start_date_obj:
+            query = query.where(func.date(Payment.captured_at) >= start_date_obj)
+        if end_date_obj:
+            query = query.where(func.date(Payment.captured_at) <= end_date_obj)
+
+        if search:
+            search_term = f"%{search.lower()}%"
+            query = query.where(
+                or_(
+                    func.lower(Client.name).like(search_term),
+                    Client.contact.like(search_term)
+                )
+            )
+
+        query = query.order_by(desc(Payment.captured_at))
+
+        result = await db.execute(query)
+        rows = result.all()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "AI Diet Coach"
+
+        headers = ["#", "Client Name", "Contact", "Purchased Date", "Amount (₹)"]
+        ws.append(headers)
+
+        header_fill = PatternFill(start_color="E91E63", end_color="E91E63", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for col_num in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        def fmt_date(d):
+            if not d:
+                return "N/A"
+            return d.strftime("%Y-%m-%d")
+
+        for idx, row in enumerate(rows, start=1):
+            amount_rupees = float(row.amount_minor / 100) if row.amount_minor else 0.0
+            ws.append([
+                idx,
+                row.client_name or "N/A",
+                row.client_contact or "N/A",
+                fmt_date(row.purchased_at),
+                f"{amount_rupees:.2f}",
+            ])
+
+        for column in ws.columns:
+            max_length = 0
+            col_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_length + 2, 50)
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"ai_diet_coach_{timestamp}.xlsx"
+
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    except Exception as e:
+        import logging
+        logging.error(f"[EXPORT_AI_DIET_COACH] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while exporting AI diet coach"
+        )
+
+
+@router.get("/client-purchase-summary/{client_id}")
+async def get_client_purchase_summary(
+    client_id: int,
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Get an aggregated, grouped summary of a client's purchases.
+    Groups gym-related purchases by gym name, and others by category.
+    Optimized to use fully async execution with zero N+1 queries.
+    """
+    try:
+        # We run several aggregate queries concurrently or sequentially
+
+        EXCLUDED_CONTACTS = ["7373675762", "9486987082", "8667458723", "9840633149", "8667427956", "8667488723", "7975847236"]
+
+        # Fetch client contact to check if it's a test account
+        client_contact_stmt = select(Client.contact).where(Client.client_id == client_id)
+        client_contact = (await db.execute(client_contact_stmt)).scalar()
+        is_test_client = client_contact in EXCLUDED_CONTACTS
+
+        # 1. Daily Pass grouped by Gym (Option A: Days * Headcount)
+        dp_stmt = (
+            select(
+                Gym.name.label("gym_name"),
+                func.coalesce(func.sum(DailyPass.days_total * DailyPass.head_count), 0).label("count")
+            )
+            .select_from(DailyPass)
+            .join(Gym, cast(DailyPass.gym_id, Integer) == Gym.gym_id)
+            .where(
+                or_(DailyPass.gym_id != "1", DailyPass.gym_id.is_(None)),
+                or_(
+                    DailyPass.client_id == str(client_id),
+                    cast(DailyPass.client_id, Integer) == client_id
+                )
+            )
+            .group_by(Gym.name)
+        )
+
+        # 2. Fitness Class (SessionPurchase) grouped by Gym (sessions_count)
+        sess_stmt = (
+            select(
+                Gym.name.label("gym_name"),
+                func.coalesce(func.sum(SessionPurchase.sessions_count), 0).label("count")
+            )
+            .select_from(SessionPurchase)
+            .join(Gym, SessionPurchase.gym_id == Gym.gym_id)
+            .where(
+                SessionPurchase.status == "paid",
+                or_(SessionPurchase.gym_id != 1, SessionPurchase.gym_id.is_(None)),
+                SessionPurchase.client_id == client_id
+            )
+            .group_by(Gym.name)
+        )
+
+        # 3. Gym Membership (Orders) grouped by Gym
+        gym_meta_cond = or_(
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.audit.source")) == "dailypass_checkout_api",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_sub",
+            func.json_unquote(func.json_extract(Order.order_metadata, "$.order_info.flow")) == "unified_gym_membership_with_free_fittbot"
+        )
+        
+        gm_stmt = (
+            select(
+                Gym.name.label("gym_name"),
+                func.count(func.distinct(Order.id)).label("count")
+            )
+            .select_from(Payment)
+            .join(Order, Order.id == Payment.order_id)
+            .join(OrderItem, OrderItem.order_id == Order.id)
+            .join(Gym, cast(OrderItem.gym_id, Integer) == Gym.gym_id)
+            .where(
+                Payment.status == "captured",
+                Order.status == "paid",
+                cast(Order.customer_id, Integer) == client_id,
+                OrderItem.gym_id.isnot(None),
+                OrderItem.gym_id != "",
+                OrderItem.gym_id != "1",
+                gym_meta_cond
+            )
+            .group_by(Gym.name)
+        )
+        if is_test_client:
+            gm_stmt = gm_stmt.where(false())
+
+        # 4. Nutritionist Plans (Payments)
+        nutri_stmt = (
+            select(func.count(Payment.id).label("count"))
+            .select_from(Payment)
+            .where(
+                Payment.status == "captured",
+                Payment.customer_id == str(client_id),
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_purchase_googleplay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "nutrition_package_razorpay",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "basic_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "expert_nutrition_plan",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "elite_nutrition_plan"
+                )
+            )
+        )
+        if is_test_client:
+            nutri_stmt = nutri_stmt.where(false())
+
+        # 5. AI Credits
+        ai_stmt = (
+            select(func.count(Payment.id).label("count"))
+            .select_from(Payment)
+            .where(
+                Payment.status == "captured",
+                Payment.customer_id == str(client_id),
+                or_(
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits",
+                    func.json_extract(Payment.payment_metadata, "$.flow") == "food_scanner_credits_razorpay"
+                )
+            )
+        )
+        if is_test_client:
+            ai_stmt = ai_stmt.where(false())
+
+        # 6. AI Diet Coach
+        ai_diet_stmt = (
+            select(func.count(Payment.id).label("count"))
+            .select_from(Payment)
+            .where(
+                Payment.status == "captured",
+                Payment.customer_id == str(client_id),
+                func.json_extract(Payment.payment_metadata, "$.flow") == "ai_diet_coach"
+            )
+        )
+        if is_test_client:
+            ai_diet_stmt = ai_diet_stmt.where(false())
+
+        dp_res = await db.execute(dp_stmt)
+        sess_res = await db.execute(sess_stmt)
+        gm_res = await db.execute(gm_stmt)
+        nutri_res = await db.execute(nutri_stmt)
+        ai_res = await db.execute(ai_stmt)
+        ai_diet_res = await db.execute(ai_diet_stmt)
+
+        response_data = {
+            "Daily Pass": [{"gym_name": row.gym_name, "count": row.count} for row in dp_res.fetchall()],
+            "Fitness Class": [{"gym_name": row.gym_name, "count": row.count} for row in sess_res.fetchall()],
+            "Gym Membership": [{"gym_name": row.gym_name, "count": row.count} for row in gm_res.fetchall()],
+            "Nutritionist Plans": {"count": nutri_res.scalar() or 0},
+            "AI Credits": {"count": ai_res.scalar() or 0},
+            "AI Diet Coach": {"count": ai_diet_res.scalar() or 0}
+        }
+
+        return {
+            "success": True,
+            "data": response_data,
+            "message": "Client purchase summary fetched successfully"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching client summary: {str(e)}")
