@@ -2,15 +2,27 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc, text, func, cast, Date as SQLDate
 from typing import Optional, Dict, List, Any
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from pydantic import BaseModel
 import json
 
 from app.models.async_database import get_async_db
 from app.models.adminmodels import Admins
 from app.models.fittbot_models import Client, ActualDiet, ActualWorkout, ClientActual
-from app.models.nutrition_models import NutritionConsultationForm
+from app.models.nutrition_models import NutritionConsultationForm, CompletedSession, ClientDietTemplate, Nutritionist
 from app.fittbot_admin_api.auth.authentication import get_current_admin_from_cookie
+
+def format_time_slot(t: time) -> str:
+    """Convert time to HH:MM AM/PM format"""
+    if not t:
+        return ""
+    return t.strftime("%I:%M %p")
+
+def convert_date_to_irst(date_value: date) -> str:
+    """Convert date object to IST date string (YYYY-MM-DD format)"""
+    if date_value is None:
+        return None
+    return date_value.isoformat()
 
 router = APIRouter(prefix="/api/admin/nutritionist_sessions", tags=["NutritionistClientDetails"])
 
@@ -101,6 +113,65 @@ async def get_client_details(
             # Fall back silently to default clients table values if query fails
             pass
 
+        # Fetch completed sessions history (Consultation History)
+        history_query = select(
+            CompletedSession.id,
+            CompletedSession.client_id,
+            CompletedSession.nutritionist_id,
+            CompletedSession.booking_id,
+            CompletedSession.schedule_id,
+            CompletedSession.meeting_duration,
+            CompletedSession.feedback_advice,
+            CompletedSession.notes,
+            CompletedSession.interested_in_nutrition_product,
+            CompletedSession.slot_date,
+            CompletedSession.slot_time,
+            CompletedSession.created_at,
+            Client.name.label('client_name'),
+            ClientDietTemplate.template_id.label('assigned_diet_template_id'),
+            ClientDietTemplate.template_name.label('assigned_diet_template_name'),
+            Nutritionist.full_name.label('nutritionist_name')
+        ).select_from(
+            CompletedSession
+        ).outerjoin(
+            Client,
+            CompletedSession.client_id == Client.client_id
+        ).outerjoin(
+            ClientDietTemplate,
+            CompletedSession.booking_id == ClientDietTemplate.booking_id
+        ).outerjoin(
+            Nutritionist,
+            CompletedSession.nutritionist_id == Nutritionist.id
+        ).where(
+            CompletedSession.client_id == client_id
+        ).order_by(
+            desc(CompletedSession.created_at)
+        )
+
+        history_result = await db.execute(history_query)
+        sessions_rows = history_result.all()
+
+        completed_sessions = []
+        for session in sessions_rows:
+            completed_sessions.append({
+                "id": session.id,
+                "client_id": session.client_id,
+                "client_name": session.client_name,
+                "nutritionist_id": session.nutritionist_id,
+                "nutritionist_name": session.nutritionist_name,
+                "booking_id": session.booking_id,
+                "schedule_id": session.schedule_id,
+                "meeting_duration": session.meeting_duration,
+                "feedback_advice": session.feedback_advice,
+                "notes": session.notes,
+                "interested_in_nutrition_product": session.interested_in_nutrition_product,
+                "slot_date": convert_date_to_irst(session.slot_date),
+                "slot_time": format_time_slot(session.slot_time),
+                "created_at": session.created_at.isoformat() if session.created_at else None,
+                "assigned_diet_template_id": session.assigned_diet_template_id,
+                "assigned_diet_template_name": session.assigned_diet_template_name
+            })
+
         return {
             "success": True,
             "data": {
@@ -120,7 +191,8 @@ async def get_client_details(
                 "medical_issues": client.medical_issues,
                 "joined_date": client.joined_date.isoformat() if client.joined_date else None,
                 "dob": client.dob.isoformat() if client.dob else None,
-                "status": client.status
+                "status": client.status,
+                "consultation_history": completed_sessions
             }
         }
     except HTTPException:
