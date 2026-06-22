@@ -41,6 +41,7 @@ async def get_completed_sessions_list(
     start_date: Optional[date] = Query(None, description="Filter by start date (ISO format YYYY-MM-DD)"),
     end_date: Optional[date] = Query(None, description="Filter by end date (ISO format YYYY-MM-DD)"),
     interested_in_product: Optional[bool] = Query(None, description="Filter by product interest"),
+    client_wise: bool = Query(False, description="Whether to group by client"),
     db: AsyncSession = Depends(get_async_db),
     admin: Admins = Depends(get_current_admin_from_cookie)
 ):
@@ -75,16 +76,28 @@ async def get_completed_sessions_list(
             )
 
         # Count query for total records (with all filters applied)
-        count_query = select(
-            func.count(CompletedSession.id)
-        ).select_from(
-            CompletedSession
-        ).outerjoin(
-            Client,
-            CompletedSession.client_id == Client.client_id
-        ).where(
-            and_(*conditions)
-        )
+        if client_wise:
+            count_query = select(
+                func.count(func.distinct(CompletedSession.client_id))
+            ).select_from(
+                CompletedSession
+            ).outerjoin(
+                Client,
+                CompletedSession.client_id == Client.client_id
+            ).where(
+                and_(*conditions)
+            )
+        else:
+            count_query = select(
+                func.count(CompletedSession.id)
+            ).select_from(
+                CompletedSession
+            ).outerjoin(
+                Client,
+                CompletedSession.client_id == Client.client_id
+            ).where(
+                and_(*conditions)
+            )
 
         count_result = await db.execute(count_query)
         total_count = count_result.scalar() or 0
@@ -94,84 +107,130 @@ async def get_completed_sessions_list(
         offset = (page - 1) * page_size
 
         # Main query with JOIN, filters, ordering, and pagination
-        # Single optimized query - no N+1 pattern
-        query = select(
-            CompletedSession.id,
-            CompletedSession.client_id,
-            CompletedSession.nutritionist_id,
-            CompletedSession.booking_id,
-            CompletedSession.schedule_id,
-            CompletedSession.meeting_duration,
-            CompletedSession.feedback_advice,
-            CompletedSession.notes,
-            CompletedSession.interested_in_nutrition_product,
-            CompletedSession.slot_date,
-            CompletedSession.slot_time,
-            CompletedSession.created_at,
-            Client.name.label('client_name'),
-            Client.contact.label('client_contact'),
-            ClientDietTemplate.template_id.label('assigned_diet_template_id'),
-            ClientDietTemplate.template_name.label('assigned_diet_template_name'),
-            NutritionBooking.session_number,
-            NutritionEligibility.total_sessions
-        ).select_from(
-            CompletedSession
-        ).outerjoin(
-            Client,
-            CompletedSession.client_id == Client.client_id
-        ).outerjoin(
-            ClientDietTemplate,
-            CompletedSession.booking_id == ClientDietTemplate.booking_id
-        ).outerjoin(
-            NutritionBooking,
-            CompletedSession.booking_id == NutritionBooking.id
-        ).outerjoin(
-            NutritionEligibility,
-            NutritionBooking.eligibility_id == NutritionEligibility.id
-        ).where(
-            and_(*conditions)
-        ).order_by(
-            desc(CompletedSession.created_at)
-        ).offset(
-            offset
-        ).limit(
-            page_size
-        )
+        if client_wise:
+            query = select(
+                CompletedSession.client_id,
+                Client.name.label('client_name'),
+                Client.contact.label('client_contact'),
+                func.max(CompletedSession.created_at).label('last_session_at')
+            ).select_from(
+                CompletedSession
+            ).outerjoin(
+                Client,
+                CompletedSession.client_id == Client.client_id
+            ).where(
+                and_(*conditions)
+            ).group_by(
+                CompletedSession.client_id,
+                Client.name,
+                Client.contact
+            ).order_by(
+                desc(func.max(CompletedSession.created_at))
+            ).offset(
+                offset
+            ).limit(
+                page_size
+            )
+        else:
+            query = select(
+                CompletedSession.id,
+                CompletedSession.client_id,
+                CompletedSession.nutritionist_id,
+                CompletedSession.booking_id,
+                CompletedSession.schedule_id,
+                CompletedSession.meeting_duration,
+                CompletedSession.feedback_advice,
+                CompletedSession.notes,
+                CompletedSession.interested_in_nutrition_product,
+                CompletedSession.slot_date,
+                CompletedSession.slot_time,
+                CompletedSession.created_at,
+                Client.name.label('client_name'),
+                Client.contact.label('client_contact'),
+                ClientDietTemplate.template_id.label('assigned_diet_template_id'),
+                ClientDietTemplate.template_name.label('assigned_diet_template_name'),
+                NutritionBooking.session_number,
+                NutritionEligibility.total_sessions
+            ).select_from(
+                CompletedSession
+            ).outerjoin(
+                Client,
+                CompletedSession.client_id == Client.client_id
+            ).outerjoin(
+                ClientDietTemplate,
+                CompletedSession.booking_id == ClientDietTemplate.booking_id
+            ).outerjoin(
+                NutritionBooking,
+                CompletedSession.booking_id == NutritionBooking.id
+            ).outerjoin(
+                NutritionEligibility,
+                NutritionBooking.eligibility_id == NutritionEligibility.id
+            ).where(
+                and_(*conditions)
+            ).order_by(
+                desc(CompletedSession.created_at)
+            ).offset(
+                offset
+            ).limit(
+                page_size
+            )
 
         result = await db.execute(query)
         sessions = result.all()
 
         # Format response
         completed_sessions = []
-        for session in sessions:
-            session_num = session.session_number
-            total_sess = session.total_sessions
-            if session_num is not None and total_sess is not None:
-                plan_display = f"{session_num} / {total_sess}"
-            elif total_sess is not None:
-                plan_display = f"- / {total_sess}"
-            else:
-                plan_display = "-"
+        if client_wise:
+            for session in sessions:
+                completed_sessions.append({
+                    "id": None,
+                    "client_id": session.client_id,
+                    "client_name": session.client_name,
+                    "client_contact": session.client_contact,
+                    "nutritionist_id": nutritionist_id,
+                    "booking_id": None,
+                    "schedule_id": None,
+                    "meeting_duration": None,
+                    "feedback_advice": None,
+                    "notes": None,
+                    "interested_in_nutrition_product": None,
+                    "slot_date": None,
+                    "slot_time": None,
+                    "created_at": session.last_session_at.isoformat() if session.last_session_at else None,
+                    "assigned_diet_template_id": None,
+                    "assigned_diet_template_name": None,
+                    "plan": None
+                })
+        else:
+            for session in sessions:
+                session_num = session.session_number
+                total_sess = session.total_sessions
+                if session_num is not None and total_sess is not None:
+                    plan_display = f"{session_num} / {total_sess}"
+                elif total_sess is not None:
+                    plan_display = f"- / {total_sess}"
+                else:
+                    plan_display = "-"
 
-            completed_sessions.append({
-                "id": session.id,
-                "client_id": session.client_id,
-                "client_name": session.client_name,
-                "client_contact": session.client_contact,
-                "nutritionist_id": session.nutritionist_id,
-                "booking_id": session.booking_id,
-                "schedule_id": session.schedule_id,
-                "meeting_duration": session.meeting_duration,
-                "feedback_advice": session.feedback_advice,
-                "notes": session.notes,
-                "interested_in_nutrition_product": session.interested_in_nutrition_product,
-                "slot_date": convert_date_to_irst(session.slot_date),
-                "slot_time": format_time_slot(session.slot_time),
-                "created_at": session.created_at.isoformat() if session.created_at else None,
-                "assigned_diet_template_id": session.assigned_diet_template_id,
-                "assigned_diet_template_name": session.assigned_diet_template_name,
-                "plan": plan_display
-            })
+                completed_sessions.append({
+                    "id": session.id,
+                    "client_id": session.client_id,
+                    "client_name": session.client_name,
+                    "client_contact": session.client_contact,
+                    "nutritionist_id": session.nutritionist_id,
+                    "booking_id": session.booking_id,
+                    "schedule_id": session.schedule_id,
+                    "meeting_duration": session.meeting_duration,
+                    "feedback_advice": session.feedback_advice,
+                    "notes": session.notes,
+                    "interested_in_nutrition_product": session.interested_in_nutrition_product,
+                    "slot_date": convert_date_to_irst(session.slot_date),
+                    "slot_time": format_time_slot(session.slot_time),
+                    "created_at": session.created_at.isoformat() if session.created_at else None,
+                    "assigned_diet_template_id": session.assigned_diet_template_id,
+                    "assigned_diet_template_name": session.assigned_diet_template_name,
+                    "plan": plan_display
+                })
 
         return {
             "success": True,
