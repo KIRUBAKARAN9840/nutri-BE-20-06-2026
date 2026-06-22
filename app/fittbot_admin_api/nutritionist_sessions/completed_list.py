@@ -112,7 +112,8 @@ async def get_completed_sessions_list(
                 CompletedSession.client_id,
                 Client.name.label('client_name'),
                 Client.contact.label('client_contact'),
-                func.max(CompletedSession.created_at).label('last_session_at')
+                func.max(CompletedSession.slot_date).label('last_session_date'),
+                func.max(CompletedSession.slot_time).label('last_session_time')
             ).select_from(
                 CompletedSession
             ).outerjoin(
@@ -125,7 +126,8 @@ async def get_completed_sessions_list(
                 Client.name,
                 Client.contact
             ).order_by(
-                desc(func.max(CompletedSession.created_at))
+                desc(func.max(CompletedSession.slot_date)),
+                desc(func.max(CompletedSession.slot_time))
             ).offset(
                 offset
             ).limit(
@@ -194,9 +196,9 @@ async def get_completed_sessions_list(
                     "feedback_advice": None,
                     "notes": None,
                     "interested_in_nutrition_product": None,
-                    "slot_date": None,
-                    "slot_time": None,
-                    "created_at": session.last_session_at.isoformat() if session.last_session_at else None,
+                    "slot_date": convert_date_to_irst(session.last_session_date),
+                    "slot_time": format_time_slot(session.last_session_time),
+                    "created_at": None,
                     "assigned_diet_template_id": None,
                     "assigned_diet_template_name": None,
                     "plan": None
