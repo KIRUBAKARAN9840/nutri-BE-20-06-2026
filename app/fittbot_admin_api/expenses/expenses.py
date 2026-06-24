@@ -122,6 +122,8 @@ async def get_expenses_summary(
     try:
         # Build base conditions
         conditions = []
+        start_date_obj = None
+        end_date_obj = None
 
         if start_date:
             try:
@@ -243,6 +245,26 @@ async def get_expenses_summary(
         operational_percentage = (operational_total / grand_total * 100) if grand_total > 0 else 0
         marketing_percentage = (marketing_total / grand_total * 100) if grand_total > 0 else 0
 
+        # Calculate ROAS based on total revenue from revenue_service.py
+        start_date_val = start_date_obj if start_date_obj else date(2020, 1, 1)
+        end_date_val = end_date_obj if end_date_obj else date.today()
+
+        from app.fittbot_admin_api.revenue_service import get_revenue_breakdown
+        revenue_data = await get_revenue_breakdown(
+            db=db,
+            start_date=start_date_val,
+            end_date=end_date_val,
+            exclude_gym_id_one=True
+        )
+        total_revenue_rupees = float(revenue_data.total_revenue) / 100.0
+
+        roas = 0.0
+        marketing_to_revenue_ratio = 0.0
+        if total_revenue_rupees > 0:
+            marketing_to_revenue_ratio = float(marketing_total) / total_revenue_rupees
+        if marketing_total > 0:
+            roas = total_revenue_rupees / float(marketing_total)
+
         return {
             "success": True,
             "data": {
@@ -262,6 +284,11 @@ async def get_expenses_summary(
                 },
                 "operational_breakdown": operational_totals,
                 "marketing_breakdown": marketing_totals,
+
+                # ROAS & Revenue calculations
+                "total_revenue": round(total_revenue_rupees, 2),
+                "roas": round(roas, 2),
+                "marketing_to_revenue_ratio": round(marketing_to_revenue_ratio, 4),
 
                 # Expense types (predefined)
                 "expense_types": {
